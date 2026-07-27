@@ -6,13 +6,8 @@
   "ui": "ui.html",
   "editorType": ["figma"],
   "networkAccess": {
-    "allowedDomains": [
-      "http://localhost:1234",
-      "http://localhost:11434",
-      "http://localhost:8787",
-      "https://poppods-mac-mini.tail8b150d.ts.net:8443"
-    ],
+    "allowedDomains": ["http://localhost:8787"],
     "devAllowedDomains": ["*"],
-    "reasoning": "Sends node data to a locally-running LLM server (LM Studio / Ollama) on the user's own machine, or to the user's own Mac mini over their private Tailscale network, to generate Flutter/HTML/CSS code. No data leaves the user's own devices."
+    "reasoning": "Optional local debug server on the user's own machine, used only while the Connect button is toggled on, to dump the selected layers for troubleshooting. Nothing is sent anywhere by default and no data leaves the user's own machine."
   }
 }

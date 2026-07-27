@@ -61,7 +61,7 @@
     overflow-y: auto;
     margin: 0 0 8px 0;
   }
-  .copy-btn, .primary-btn {
+  .copy-btn {
     background: #18a0fb;
     color: #fff;
     border: none;
@@ -70,20 +70,21 @@
     font-size: 11px;
     cursor: pointer;
   }
-  .copy-btn:hover, .primary-btn:hover { background: #0d8ce0; }
-  .copy-btn:disabled, .primary-btn:disabled { background: #b8e0fd; cursor: default; }
+  .copy-btn:hover { background: #0d8ce0; }
+  .copy-btn:disabled { background: #b8e0fd; cursor: default; }
   .empty-state {
     padding: 40px 16px;
     text-align: center;
     color: #8c8c8c;
   }
-  .endpoint-row {
+  .select-row {
     display: flex;
+    align-items: center;
     gap: 6px;
-    margin-bottom: 8px;
+    padding: 6px 12px;
+    border-bottom: 1px solid #e6e6e6;
   }
-  .endpoint-row input,
-  .endpoint-row select {
+  .select-row select {
     flex: 1;
     padding: 6px 8px;
     border: 1px solid #e6e6e6;
@@ -91,15 +92,6 @@
     font-size: 11px;
     background: #fff;
     color: inherit;
-  }
-  .ai-error {
-    background: #ffe8e6;
-    color: #b3261e;
-    border: 1px solid #ffb4ac;
-    border-radius: 4px;
-    padding: 6px 8px;
-    margin-bottom: 8px;
-    font-size: 11px;
   }
   .hint {
     color: #8c8c8c;
@@ -211,9 +203,9 @@
     .tabs { border-bottom-color: #444; }
     .tab { color: #9a9a9a; }
     pre.code-block { background: #1e1e1e; border-color: #444; color: #eaeaea; }
-    .endpoint-row input, .endpoint-row select { background: #1e1e1e; border-color: #444; color: #eaeaea; }
+    .select-row { border-bottom-color: #444; }
+    .select-row select { background: #1e1e1e; border-color: #444; color: #eaeaea; }
     .warning { background: #3a2e12; color: #f0c060; border-color: #5a4720; }
-    .ai-error { background: #3a1a17; color: #ff8f85; border-color: #5a2a24; }
     .status-ok { color: #4ade80; }
     .status-error { color: #ff8f85; }
     .preview-figma-img { border-color: #444; }
@@ -231,9 +223,16 @@
   <button class="tab active" data-tab="css">CSS</button>
   <button class="tab" data-tab="flutter">Flutter</button>
   <button class="tab" data-tab="html">HTML</button>
-  <button class="tab" data-tab="ai">AI-enhanced</button>
   <button class="tab" data-tab="design">Design System</button>
   <button class="tab" data-tab="preview">Preview</button>
+</div>
+
+<!-- Only shown for a multi-selection: CSS/Flutter/HTML/Preview are per-layer, so
+     the picker chooses which one those tabs are showing. The Design System tab
+     always covers the whole selection. -->
+<div id="selection-row" class="select-row" style="display:none;">
+  <select id="node-select"></select>
+  <span id="selection-note" class="hint" style="margin:0;"></span>
 </div>
 
 <div id="debug-send-row" class="debug-send-row" style="display:none;">
@@ -264,57 +263,33 @@
     <button class="copy-btn" data-copy="html-output">Copy HTML</button>
   </div>
 
-  <div class="panel" id="panel-ai">
-    <div class="node-name" id="ai-node-name"></div>
-
-    <div class="endpoint-row">
-      <select id="ai-preset">
-        <option value="lmstudio">LM Studio</option>
-        <option value="ollama">Ollama</option>
-        <option value="custom">Custom</option>
-      </select>
-    </div>
-    <div class="endpoint-row">
-      <input id="ai-base-url" type="text" value="http://localhost:1234/v1" />
-      <button class="copy-btn" id="ai-test-btn" style="flex-shrink:0;">Test connection</button>
-    </div>
-    <div id="ai-status" class="hint">Not connected yet — pick a preset (or enter any OpenAI-compatible base URL) and test.</div>
-
-    <div class="endpoint-row">
-      <select id="ai-model" disabled>
-        <option value="">Test connection to load models</option>
-      </select>
-    </div>
-
-    <div class="endpoint-row">
-      <select id="ai-format">
-        <option value="flutter">Flutter / Dart</option>
-        <option value="html">HTML + CSS</option>
-        <option value="css">CSS only</option>
-      </select>
-    </div>
-    <button class="primary-btn" id="ai-generate-btn">Generate with local AI</button>
-    <div id="ai-error"></div>
-    <pre class="code-block" id="ai-output" style="margin-top:8px;"></pre>
-    <button class="copy-btn" id="ai-copy-btn" data-copy="ai-output" disabled>Copy code</button>
-  </div>
-
   <div class="panel" id="panel-design">
     <div class="node-name" id="design-node-name"></div>
-    <div class="hint">Tokens and component usage found in the selected subtree. Font availability is checked against Figma.</div>
+    <div class="hint">Everything selected, combined. Variables and styles are read from Figma by name; values are only inferred where a layer has none bound.</div>
     <div id="design-summary" class="system-summary"></div>
+    <div id="design-coverage" class="hint"></div>
+
+    <div class="system-title">Figma variables</div>
+    <div id="design-variables" class="component-list"></div>
+
+    <div class="system-title">Figma styles</div>
+    <div id="design-styles" class="component-list"></div>
+
+    <div class="system-title">Components</div>
+    <div id="design-component-library" class="component-list"></div>
 
     <div class="system-title">Fonts</div>
     <div id="design-fonts" class="font-list"></div>
 
-    <div class="system-title">Component mapping</div>
+    <div class="system-title">Token usage per layer</div>
     <div id="design-components" class="component-list"></div>
 
     <div class="design-export-row">
       <select id="design-export-format">
-        <option value="css">CSS tokens + @font-face</option>
+        <option value="css">CSS variables + tokens</option>
         <option value="flutter">Flutter theme + pubspec</option>
-        <option value="json">Design Tokens JSON / AI</option>
+        <option value="components">Component scaffolds (Dart)</option>
+        <option value="json">Design tokens JSON</option>
       </select>
       <button class="copy-btn" data-copy="design-output">Copy</button>
     </div>
@@ -339,7 +314,15 @@
 </div>
 
 <script>
-  let currentPayload = null;
+  // The whole selection message, plus which of its layers the per-layer tabs are
+  // currently showing.
+  let currentSelection = null;
+  let activeIndex = 0;
+
+  function activePayload() {
+    if (!currentSelection || !currentSelection.nodes || currentSelection.nodes.length === 0) return null;
+    return currentSelection.nodes[Math.min(activeIndex, currentSelection.nodes.length - 1)] || null;
+  }
 
   document.querySelectorAll('.tab').forEach((tab) => {
     tab.addEventListener('click', () => {
@@ -405,21 +388,61 @@
       .join('\n');
   }
 
-  function render(payload) {
-    currentPayload = payload;
+  function render(message) {
+    currentSelection = message;
+    activeIndex = 0;
     document.getElementById('empty-state').style.display = 'none';
     document.getElementById('panels').style.display = 'block';
     document.getElementById('debug-send-row').style.display = 'flex';
-    if (debugConnected) sendDebugPayload(payload);
+    if (debugConnected) sendDebugPayload(message);
+
+    renderSelectionPicker(message);
+    renderDesignSystem(message.designSystem);
+    renderActiveNode();
+  }
+
+  function renderSelectionPicker(message) {
+    const row = document.getElementById('selection-row');
+    const select = document.getElementById('node-select');
+    const note = document.getElementById('selection-note');
+    const nodes = message.nodes || [];
+
+    if (message.selectionCount <= 1) {
+      row.style.display = 'none';
+      select.innerHTML = '';
+      return;
+    }
+
+    row.style.display = 'flex';
+    select.innerHTML = '';
+    nodes.forEach((payload, index) => {
+      const option = document.createElement('option');
+      option.value = String(index);
+      option.textContent = `${index + 1}/${nodes.length} · ${payload.nodeName}`;
+      select.appendChild(option);
+    });
+    select.value = '0';
+    note.textContent = message.skippedCount
+      ? `+${message.skippedCount} more in the design system only`
+      : `${message.selectionCount} layers selected`;
+  }
+
+  document.getElementById('node-select').addEventListener('change', (event) => {
+    activeIndex = Number(event.target.value) || 0;
+    renderActiveNode();
+  });
+
+  function renderActiveNode() {
+    const payload = activePayload();
+    if (!payload) return;
 
     document.getElementById('css-node-name').textContent = payload.nodeName;
     document.getElementById('flutter-node-name').textContent = payload.nodeName;
     document.getElementById('html-node-name').textContent = payload.nodeName;
-    document.getElementById('ai-node-name').textContent = payload.nodeName;
-    document.getElementById('design-node-name').textContent = payload.nodeName;
+    document.getElementById('design-node-name').textContent =
+      currentSelection.designSystem ? currentSelection.designSystem.name : payload.nodeName;
     document.getElementById('preview-node-name').textContent = payload.nodeName;
 
-    renderDesignSystem(payload.designSystem);
     renderPreview(payload);
 
     const warningsEl = document.getElementById('css-warnings');
@@ -431,25 +454,131 @@
       warningsEl.appendChild(div);
     });
 
-    document.getElementById('css-output').textContent = '.' + safeSelector(payload.nodeName) + ' {\n' + formatCss(payload.css) + '\n}';
+    document.getElementById('css-output').textContent =
+      '.' + safeSelector(payload.nodeName) + ' {\n' + formatCss(payload.css) + '\n}';
     document.getElementById('flutter-output').textContent = payload.dart;
     document.getElementById('html-output').textContent = payload.html;
+  }
 
-    // reset AI tab per new selection
-    document.getElementById('ai-output').textContent = '';
-    document.getElementById('ai-copy-btn').disabled = true;
-    document.getElementById('ai-error').innerHTML = '';
+  // Small card: bold name on top, muted detail underneath, optional pill on the right.
+  function systemCard(name, meta, badge) {
+    const card = document.createElement('div');
+    card.className = 'system-card';
+    const row = document.createElement('div');
+    row.className = 'system-card-row';
+    const content = document.createElement('div');
+    const nameEl = document.createElement('div');
+    nameEl.className = 'system-card-name';
+    nameEl.textContent = name;
+    content.appendChild(nameEl);
+    if (meta) {
+      const metaEl = document.createElement('div');
+      metaEl.className = 'system-card-meta';
+      metaEl.textContent = meta;
+      content.appendChild(metaEl);
+    }
+    row.appendChild(content);
+    if (badge) {
+      const badgeEl = document.createElement('span');
+      badgeEl.className = 'font-status ' + (badge.tone || 'unknown');
+      badgeEl.textContent = badge.text;
+      row.appendChild(badgeEl);
+    }
+    card.appendChild(row);
+    return card;
+  }
+
+  function renderEmptyNote(container, text) {
+    const empty = document.createElement('div');
+    empty.className = 'system-card-meta';
+    empty.textContent = text;
+    container.appendChild(empty);
+  }
+
+  function variableValueSummary(variable) {
+    return variable.modeValues
+      .map((mode) => {
+        const value = mode.aliasToken ? `→ ${mode.alias}` : String(mode.value);
+        return variable.modeValues.length > 1 ? `${mode.modeName}: ${value}` : value;
+      })
+      .join(' · ');
   }
 
   function renderDesignSystem(system) {
     const summary = document.getElementById('design-summary');
     const fontsEl = document.getElementById('design-fonts');
     const componentsEl = document.getElementById('design-components');
+    const variablesEl = document.getElementById('design-variables');
+    const stylesEl = document.getElementById('design-styles');
+    const libraryEl = document.getElementById('design-component-library');
+    const coverageEl = document.getElementById('design-coverage');
     summary.innerHTML = '';
     fontsEl.innerHTML = '';
     componentsEl.innerHTML = '';
+    variablesEl.innerHTML = '';
+    stylesEl.innerHTML = '';
+    libraryEl.innerHTML = '';
+
+    const variables = (system && system.variables) || [];
+    const styles = (system && system.styles) || [];
+    const library = (system && system.componentLibrary) || [];
+    const coverage = (system && system.coverage) || null;
+
+    coverageEl.textContent = coverage
+      ? `${coverage.bound}/${coverage.total} tokens (${coverage.ratio}%) come from a Figma variable or style — the rest were inferred from raw values.`
+      : '';
+
+    if (variables.length === 0) {
+      renderEmptyNote(variablesEl, 'No bound variables in this selection — token names below are inferred from values.');
+    } else {
+      variables.forEach((variable) => {
+        variablesEl.appendChild(
+          systemCard(
+            variable.name,
+            `--${variable.token} · ${variableValueSummary(variable)}${variable.collection ? ` · ${variable.collection}` : ''}`,
+            { text: `${variable.usageCount}×`, tone: 'available' }
+          )
+        );
+      });
+    }
+
+    if (styles.length === 0) {
+      renderEmptyNote(stylesEl, 'No Figma styles applied in this selection.');
+    } else {
+      styles.forEach((style) => {
+        stylesEl.appendChild(
+          systemCard(style.name, `${style.roles.join(', ')} · --${style.token}`, {
+            text: `${style.usageCount}×`,
+            tone: 'available',
+          })
+        );
+      });
+    }
+
+    if (library.length === 0) {
+      renderEmptyNote(libraryEl, 'No component instances in this selection.');
+    } else {
+      library.forEach((component) => {
+        const axes = Object.keys(component.variantAxes).map(
+          (axis) => `${axis}=${component.variantAxes[axis].join('|')}`
+        );
+        const props = Object.keys(component.properties).filter((name) => !(name in component.variantAxes));
+        const meta = [axes.join(', '), props.length ? `props: ${props.join(', ')}` : '']
+          .filter(Boolean)
+          .join(' · ');
+        libraryEl.appendChild(
+          systemCard(component.name, meta || 'No variants or properties', {
+            text: `${component.usageCount}×`,
+            tone: component.remote ? 'available' : 'unknown',
+          })
+        );
+      });
+    }
 
     [
+      ['Variables', variables.length],
+      ['Styles', styles.length],
+      ['Components', library.length],
       ['Fonts', (system && system.fonts.length) || 0],
       ['Type styles', (system && system.typography.length) || 0],
       ['Colors', (system && system.colors.length) || 0],
@@ -526,7 +655,7 @@
 
   function updateDesignExport() {
     const format = document.getElementById('design-export-format').value;
-    const exports = currentPayload && currentPayload.designSystem && currentPayload.designSystem.exports;
+    const exports = currentSelection && currentSelection.designSystem && currentSelection.designSystem.exports;
     document.getElementById('design-output').textContent = (exports && exports[format]) || '';
   }
 
@@ -604,10 +733,12 @@
   }
 
   function showEmpty() {
-    currentPayload = null;
+    currentSelection = null;
+    activeIndex = 0;
     document.getElementById('empty-state').style.display = 'block';
     document.getElementById('panels').style.display = 'none';
     document.getElementById('debug-send-row').style.display = 'none';
+    document.getElementById('selection-row').style.display = 'none';
   }
 
   // Once connected, every new selection (render() call) gets pushed to the
@@ -626,7 +757,9 @@
       });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       status.className = 'hint status-ok';
-      status.textContent = `Connected — sent "${payload.nodeName}" ✓`;
+      const label =
+        payload.selectionCount > 1 ? `${payload.selectionCount} layers` : `"${payload.nodeName}"`;
+      status.textContent = `Connected — sent ${label} ✓`;
     } catch (err) {
       status.className = 'hint status-error';
       status.textContent = 'Send failed — is the debug server running? ' + (err && err.message ? err.message : err);
@@ -641,7 +774,7 @@
     if (debugConnected) {
       status.className = 'hint status-ok';
       status.textContent = 'Connected — selections will auto-send.';
-      if (currentPayload) sendDebugPayload(currentPayload);
+      if (currentSelection) sendDebugPayload(currentSelection);
     } else {
       status.className = 'hint';
       status.textContent = 'Not connected — every selection stays local until you connect.';
@@ -660,182 +793,4 @@
     }
   };
 
-  const RECURSION_RULE =
-    'CRITICAL: The JSON tree may be deeply nested with many children at every level. You MUST walk the entire tree and ' +
-    'emit code for every single node, at every depth, with no exceptions. Never summarize, truncate, skip, or merge ' +
-    'nodes for brevity unless rule (2) below explicitly applies (exact repeated pattern → loop/builder). If you are ' +
-    'unsure whether two nodes are "the same repeated pattern", treat them as different and emit both in full. ';
-
-  const POSITION_RULE =
-    'CRITICAL: A child object that has "x" and "y" fields belongs to a parent with NO "layout" field — that parent ' +
-    'does NOT flow its children in a row/column, it places them freely at those exact pixel offsets from its own ' +
-    'top-left corner, and they may overlap. You MUST position such a child at that exact offset (absolute/free ' +
-    'positioning) — never just stack it under the previous sibling in normal document flow. A child with no ' +
-    '"x"/"y" fields belongs to a "layout": "row"/"column" parent and should flow normally via that layout instead. ';
-
-  const SYSTEM_PROMPTS = {
-    flutter:
-      'You are a Flutter code generator. Convert the given Figma node JSON tree into idiomatic Dart widget code. ' +
-      RECURSION_RULE +
-      POSITION_RULE +
-      'Rules: (1) Name widgets and local variables after each node\'s "name" field (converted to lowerCamelCase). ' +
-      '(2) If a frame has multiple children that repeat the same structure/pattern, generate a single ListView.builder ' +
-      'over a data list instead of repeating widget code. (3) Wrap nodes in Container with width/height/decoration ' +
-      'matching the JSON. (4) Use Row/Column for "layout": "row"/"column". For a node whose children have "x"/"y" ' +
-      'instead, use Stack with each child wrapped in Positioned(left: x, top: y, child: ...). ' +
-      '(5) Use the supplied designSystem typography/component token mapping for exact font family, weight, size, ' +
-      'line height, letter spacing, and colors. Never substitute or guess a font family. ' +
-      '(6) Respond with ONLY the Dart code, no explanation, no markdown fences.',
-    html:
-      'You are a front-end code generator. Convert the given Figma node JSON tree into semantic HTML with a matching ' +
-      'CSS stylesheet. ' +
-      RECURSION_RULE +
-      POSITION_RULE +
-      'Rules: (1) Name classes after each node\'s "name" field (kebab-case). (2) If a frame has multiple ' +
-      'children that repeat the same structure/pattern, generate one reusable markup block instead of repeating it verbatim. ' +
-      '(3) Use flexbox for "layout": "row"/"column" nodes, matching gap and padding. For a node whose children have ' +
-      '"x"/"y" instead, give that node position: relative and each such child position: absolute; left: x; top: y. ' +
-      '(4) Use the supplied designSystem tokens and component mapping. Never guess or substitute a font family. ' +
-      '(5) Respond with ONLY the HTML and a <style> block, no explanation, no markdown fences.',
-    css:
-      'You are a CSS generator. Convert the given Figma node JSON tree into a CSS stylesheet only (no HTML markup). ' +
-      RECURSION_RULE +
-      POSITION_RULE +
-      'Rules: (1) Name each rule after the node\'s "name" field (kebab-case class). (2) Use flexbox for "layout": ' +
-      '"row"/"column" nodes, matching gap and padding. For a node whose children have "x"/"y" instead, give that node ' +
-      'position: relative and each such child position: absolute; left: x; top: y. ' +
-      '(3) Use the supplied designSystem tokens and component mapping. Never guess or substitute a font family. ' +
-      '(4) Respond with ONLY CSS, no explanation, no markdown fences.',
-  };
-
-  const PRESET_BASE_URLS = {
-    lmstudio: 'http://localhost:1234/v1',
-    ollama: 'http://localhost:11434/v1',
-    custom: '',
-  };
-
-  function getBaseUrl() {
-    return document.getElementById('ai-base-url').value.trim().replace(/\/+$/, '');
-  }
-
-  document.getElementById('ai-preset').addEventListener('change', (e) => {
-    const preset = e.target.value;
-    if (preset !== 'custom') {
-      document.getElementById('ai-base-url').value = PRESET_BASE_URLS[preset];
-    }
-  });
-
-  document.getElementById('ai-test-btn').addEventListener('click', async () => {
-    const baseUrl = getBaseUrl();
-    const statusEl = document.getElementById('ai-status');
-    const modelSelect = document.getElementById('ai-model');
-    const testBtn = document.getElementById('ai-test-btn');
-
-    statusEl.className = 'hint';
-    statusEl.textContent = 'Connecting...';
-    testBtn.disabled = true;
-
-    try {
-      const res = await fetch(`${baseUrl}/models`);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const data = await res.json();
-      const models = ((data && data.data) || []).map((m) => m.id).filter(Boolean);
-      if (models.length === 0) throw new Error('server returned no models');
-
-      modelSelect.innerHTML = '';
-      models.forEach((id) => {
-        const opt = document.createElement('option');
-        opt.value = id;
-        opt.textContent = id;
-        modelSelect.appendChild(opt);
-      });
-      modelSelect.disabled = false;
-
-      statusEl.className = 'hint status-ok';
-      statusEl.textContent = `เชื่อมต่อสำเร็จ — พบ ${models.length} model`;
-    } catch (err) {
-      modelSelect.innerHTML = '<option value="">Test connection to load models</option>';
-      modelSelect.disabled = true;
-
-      statusEl.className = 'hint status-error';
-      statusEl.textContent =
-        `เชื่อมต่อไม่สำเร็จ เช็คว่า server (LM Studio / Ollama) เปิดอยู่และ base URL ตรง port (${baseUrl}) — ` +
-        (err && err.message ? err.message : err);
-    } finally {
-      testBtn.disabled = false;
-    }
-  });
-
-  document.getElementById('ai-generate-btn').addEventListener('click', async () => {
-    if (!currentPayload) return;
-    const btn = document.getElementById('ai-generate-btn');
-    const errorEl = document.getElementById('ai-error');
-    const outputEl = document.getElementById('ai-output');
-    const copyBtn = document.getElementById('ai-copy-btn');
-    const baseUrl = getBaseUrl();
-    const model = document.getElementById('ai-model').value || 'local-model';
-    const format = document.getElementById('ai-format').value;
-
-    errorEl.innerHTML = '';
-    outputEl.textContent = '';
-    copyBtn.disabled = true;
-    btn.disabled = true;
-    btn.textContent = 'Generating...';
-
-    try {
-      const response = await fetch(`${baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: 'system', content: SYSTEM_PROMPTS[format] },
-            {
-              role: 'user',
-              content: JSON.stringify({
-                node: currentPayload.compact,
-                designSystem: currentPayload.designSystem,
-              }),
-            },
-          ],
-          temperature: 0.2,
-          max_tokens: 8192,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error('HTTP ' + response.status);
-      }
-
-      const data = await response.json();
-      const choice = data && data.choices && data.choices[0];
-      const content = choice && choice.message ? choice.message.content : null;
-
-      if (!content) {
-        throw new Error('empty response from model');
-      }
-
-      outputEl.textContent = content.trim();
-      copyBtn.disabled = false;
-
-      if (choice.finish_reason === 'length') {
-        const div = document.createElement('div');
-        div.className = 'ai-error';
-        div.textContent =
-          'ผลลัพธ์อาจไม่ครบ — โมเดลตอบจน max_tokens เต็มก่อนเขียนจบ (ต้นไม้ node ใหญ่/ลึกเกินไปสำหรับโมเดลนี้) ' +
-          'ลองเลือก node ที่เล็กลง หรือใช้โมเดลที่รองรับ context/output ยาวกว่านี้';
-        errorEl.appendChild(div);
-      }
-    } catch (err) {
-      const div = document.createElement('div');
-      div.className = 'ai-error';
-      div.textContent =
-        `เรียก local LLM ไม่สำเร็จ เช็คว่า server เปิดอยู่และ base URL ตรง port (${baseUrl}) — ` +
-        (err && err.message ? err.message : err);
-      errorEl.appendChild(div);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = 'Generate with local AI';
-    }
-  });
 </script>

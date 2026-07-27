@@ -36,6 +36,315 @@ function mapFontStyle(style) {
   return null;
 }
 
+// ---------- Figma variables, styles, and component instances ----------
+
+// The name a designer actually gave a token ("color/brand/primary") is worth far
+// more than a value-derived guess ("color-1e88e5"), and an instance tells us
+// which parts of a screen are one reusable component instead of N lookalike
+// copies. Both live behind *async* APIs, so they get resolved in a single
+// pre-pass into an index keyed by node id. The synchronous CSS/HTML/Dart
+// extraction further down then only ever *looks up* that index — it stays
+// exactly as pure and as fast as before, and works unchanged when the index is
+// empty (no variables in the file, or an older Figma API).
+
+const variableCache = new Map();
+const variableCollectionCache = new Map();
+const figmaStyleCache = new Map();
+
+// Figma moved these getters from sync to async; try the async one first and fall
+// back so the plugin works on either API generation instead of throwing.
+async function loadCached(cache, key, loaders) {
+  if (!key || typeof key !== 'string') return null;
+  if (cache.has(key)) return cache.get(key);
+  let result = null;
+  for (const load of loaders) {
+    if (typeof load !== 'function') continue;
+    try {
+      result = await load(key);
+    } catch (e) {
+      result = null;
+    }
+    if (result) break;
+  }
+  cache.set(key, result || null);
+  return result || null;
+}
+
+function variablesApi() {
+  return typeof figma !== 'undefined' && figma.variables ? figma.variables : null;
+}
+
+function getVariableById(id) {
+  const api = variablesApi();
+  if (!api) return Promise.resolve(null);
+  return loadCached(variableCache, id, [
+    api.getVariableByIdAsync ? (key) => api.getVariableByIdAsync(key) : null,
+    api.getVariableById ? (key) => api.getVariableById(key) : null,
+  ]);
+}
+
+function getVariableCollectionById(id) {
+  const api = variablesApi();
+  if (!api) return Promise.resolve(null);
+  return loadCached(variableCollectionCache, id, [
+    api.getVariableCollectionByIdAsync ? (key) => api.getVariableCollectionByIdAsync(key) : null,
+    api.getVariableCollectionById ? (key) => api.getVariableCollectionById(key) : null,
+  ]);
+}
+
+function getFigmaStyleById(id) {
+  if (typeof figma === 'undefined') return Promise.resolve(null);
+  return loadCached(figmaStyleCache, id, [
+    figma.getStyleByIdAsync ? (key) => figma.getStyleByIdAsync(key) : null,
+    figma.getStyleById ? (key) => figma.getStyleById(key) : null,
+  ]);
+}
+
+// boundVariables entries are either a single alias ({ type, id }) or an array of
+// them aligned with fills/strokes/effects — normalize both to a flat list so
+// callers never have to care which field they are reading.
+function boundVariableEntries(boundVariables) {
+  const entries = [];
+  if (!boundVariables || typeof boundVariables !== 'object') return entries;
+  Object.keys(boundVariables).forEach((field) => {
+    const value = boundVariables[field];
+    if (!value) return;
+    if (Array.isArray(value)) {
+      value.forEach((alias, index) => {
+        if (alias && alias.id) entries.push({ field, index, id: alias.id });
+      });
+    } else if (value.id) {
+      entries.push({ field, index: null, id: value.id });
+    }
+  });
+  return entries;
+}
+
+async function formatVariableValue(value, resolvedType, depth) {
+  if (value && value.type === 'VARIABLE_ALIAS') {
+    if (depth >= 4) return null; // guards against a cyclic alias chain
+    const target = await getVariableById(value.id);
+    if (!target) return null;
+    return { alias: target.name, aliasToken: slugToken(target.name) };
+  }
+  if (resolvedType === 'COLOR' && value && typeof value.r === 'number') {
+    return { value: rgbToHex(value, value.a === undefined ? 1 : value.a) };
+  }
+  if (resolvedType === 'FLOAT' && typeof value === 'number') return { value: round(value) };
+  if (resolvedType === 'STRING' || resolvedType === 'BOOLEAN') return { value };
+  return null;
+}
+
+async function describeVariable(id) {
+  const variable = await getVariableById(id);
+  if (!variable) return null;
+  const collection = await getVariableCollectionById(variable.variableCollectionId);
+  const modes = collection && collection.modes ? collection.modes : [];
+  const defaultModeId = collection ? collection.defaultModeId : null;
+
+  const modeValues = [];
+  const valuesByMode = variable.valuesByMode || {};
+  for (const mode of modes.length > 0 ? modes : Object.keys(valuesByMode).map((modeId) => ({ modeId, name: modeId }))) {
+    if (!(mode.modeId in valuesByMode)) continue;
+    const formatted = await formatVariableValue(valuesByMode[mode.modeId], variable.resolvedType, 0);
+    if (!formatted) continue;
+    modeValues.push({
+      modeId: mode.modeId,
+      modeName: mode.name,
+      isDefault: mode.modeId === defaultModeId,
+      value: formatted.value === undefined ? null : formatted.value,
+      alias: formatted.alias || null,
+      aliasToken: formatted.aliasToken || null,
+    });
+  }
+  if (modeValues.length > 0 && !modeValues.some((mode) => mode.isDefault)) modeValues[0].isDefault = true;
+
+  return {
+    id: variable.id,
+    name: variable.name,
+    token: slugToken(variable.name),
+    resolvedType: variable.resolvedType,
+    collection: collection ? collection.name : null,
+    collectionId: variable.variableCollectionId || null,
+    remote: !!variable.remote,
+    modeValues,
+  };
+}
+
+function parseVariantName(name) {
+  // Figma names a variant "Size=md, State=hover" — the only place the axis
+  // names live when variantProperties isn't exposed.
+  const variants = {};
+  String(name || '')
+    .split(',')
+    .forEach((part) => {
+      const eq = part.indexOf('=');
+      if (eq === -1) return;
+      const key = part.slice(0, eq).trim();
+      const value = part.slice(eq + 1).trim();
+      if (key) variants[key] = value;
+    });
+  return variants;
+}
+
+async function describeInstance(node) {
+  let main = null;
+  try {
+    if (typeof node.getMainComponentAsync === 'function') main = await node.getMainComponentAsync();
+    else main = node.mainComponent || null;
+  } catch (e) {
+    main = null;
+  }
+  const set = main && main.parent && main.parent.type === 'COMPONENT_SET' ? main.parent : null;
+
+  let variantProperties = {};
+  const rawVariants = node.variantProperties || (main && main.variantProperties) || null;
+  if (rawVariants) {
+    Object.keys(rawVariants).forEach((key) => {
+      if (rawVariants[key] !== null && rawVariants[key] !== undefined) {
+        variantProperties[key] = String(rawVariants[key]);
+      }
+    });
+  } else if (main && set) {
+    variantProperties = parseVariantName(main.name);
+  }
+
+  const properties = {};
+  if (node.componentProperties) {
+    Object.keys(node.componentProperties).forEach((key) => {
+      const prop = node.componentProperties[key];
+      if (!prop) return;
+      // Figma suffixes property keys with a unique id ("Label#123:0") — the part
+      // before the "#" is the name the designer sees.
+      properties[key.split('#')[0]] = {
+        type: prop.type,
+        value: prop.type === 'INSTANCE_SWAP' ? String(prop.value) : prop.value,
+      };
+    });
+  }
+
+  const componentName = set ? set.name : main ? main.name : node.name;
+  return {
+    instanceId: node.id,
+    instanceName: node.name,
+    componentId: main ? main.id : null,
+    componentKey: main && main.key ? main.key : null,
+    componentName,
+    variantName: main ? main.name : null,
+    setId: set ? set.id : null,
+    setName: set ? set.name : null,
+    remote: main ? !!main.remote : null,
+    variantProperties,
+    properties,
+  };
+}
+
+async function collectBindings(node, index) {
+  if (!node) return index;
+  const info = { variables: [], styles: [], component: null };
+
+  for (const entry of boundVariableEntries(node.boundVariables)) {
+    const descriptor = await describeVariable(entry.id);
+    if (descriptor) info.variables.push({ ...descriptor, field: entry.field, index: entry.index });
+  }
+
+  // A paint or an effect carries its own bindings too (a color variable on one
+  // fill of several, a radius variable on one shadow).
+  const paintLists = [
+    ['fills', node.fills],
+    ['strokes', node.strokes],
+  ];
+  for (const [listName, list] of paintLists) {
+    if (!Array.isArray(list)) continue;
+    for (let i = 0; i < list.length; i += 1) {
+      for (const entry of boundVariableEntries(list[i] && list[i].boundVariables)) {
+        const descriptor = await describeVariable(entry.id);
+        if (descriptor) info.variables.push({ ...descriptor, field: `${listName}.${entry.field}`, index: i });
+      }
+    }
+  }
+  if (Array.isArray(node.effects)) {
+    for (let i = 0; i < node.effects.length; i += 1) {
+      for (const entry of boundVariableEntries(node.effects[i] && node.effects[i].boundVariables)) {
+        const descriptor = await describeVariable(entry.id);
+        if (descriptor) info.variables.push({ ...descriptor, field: `effects.${entry.field}`, index: i });
+      }
+    }
+  }
+
+  const styleFields = [
+    ['fill', 'fillStyleId'],
+    ['stroke', 'strokeStyleId'],
+    ['text', 'textStyleId'],
+    ['effect', 'effectStyleId'],
+    ['grid', 'gridStyleId'],
+  ];
+  for (const [role, prop] of styleFields) {
+    const styleId = node[prop];
+    if (!styleId || styleId === figma.mixed || typeof styleId !== 'string') continue;
+    const style = await getFigmaStyleById(styleId);
+    if (style) {
+      info.styles.push({
+        role,
+        id: styleId,
+        name: style.name,
+        token: slugToken(style.name),
+        styleType: style.type || null,
+        remote: !!style.remote,
+      });
+    }
+  }
+
+  if (node.type === 'INSTANCE') info.component = await describeInstance(node);
+
+  if (info.variables.length > 0 || info.styles.length > 0 || info.component) index.set(node.id, info);
+
+  for (const child of node.children || []) {
+    await collectBindings(child, index);
+  }
+  return index;
+}
+
+async function buildBindingIndex(nodes) {
+  const index = new Map();
+  for (const node of nodes) {
+    await collectBindings(node, index);
+  }
+  return index;
+}
+
+function variableForField(info, fields, index) {
+  if (!info || info.variables.length === 0) return null;
+  for (const field of fields) {
+    const match = info.variables.find(
+      (entry) =>
+        entry.field === field && (index === undefined || index === null || entry.index === null || entry.index === index)
+    );
+    if (match) return match;
+  }
+  return null;
+}
+
+function styleForRole(info, role) {
+  if (!info || info.styles.length === 0) return null;
+  return info.styles.find((entry) => entry.role === role) || null;
+}
+
+// A token's identity: the variable/style it came from when there is one, so two
+// different variables that happen to hold the same hex stay two tokens — and
+// the same variable stays one token even where a mode makes its value differ.
+function sourceKey(item) {
+  if (item.variable) return `var:${item.variable.id}`;
+  if (item.style) return `style:${item.style.id}`;
+  return null;
+}
+
+function sourceToken(item) {
+  if (item.variable) return item.variable.token;
+  if (item.style) return item.style.token;
+  return null;
+}
+
 // ---------- Design system extraction ----------
 
 function slugToken(value) {
@@ -94,15 +403,25 @@ function getTextStyleRuns(node) {
   }
 }
 
-function collectDesignSource(node, source) {
+function collectDesignSource(node, source, bindings) {
   if (!node || node.visible === false) return;
 
+  const info = bindings ? bindings.get(node.id) || null : null;
+  const textStyle = styleForRole(info, 'text');
+  const fillStyle = styleForRole(info, 'fill');
+  const effectStyle = styleForRole(info, 'effect');
+
+  if (info && info.component) source.instances.push(info.component);
+
   if (node.type === 'TEXT') {
+    const textColorVariable = variableForField(info, ['fills', 'fills.color']);
     getTextStyleRuns(node).forEach((run) => {
       if (!run.fontName || run.fontName === figma.mixed) return;
       source.textRuns.push({
         nodeId: node.id,
         nodeName: node.name,
+        style: textStyle,
+        colorVariable: textColorVariable,
         family: run.fontName.family,
         figmaStyle: run.fontName.style,
         weight: mapFontWeight(run.fontName.style),
@@ -117,7 +436,7 @@ function collectDesignSource(node, source) {
   }
 
   if (node.fills && node.fills !== figma.mixed) {
-    node.fills.forEach((paint) => {
+    node.fills.forEach((paint, paintIndex) => {
       if (paint.visible === false) return;
       if (paint.type === 'SOLID') {
         source.colors.push({
@@ -125,6 +444,8 @@ function collectDesignSource(node, source) {
           nodeId: node.id,
           nodeName: node.name,
           role: node.type === 'TEXT' ? 'text' : 'fill',
+          variable: variableForField(info, ['fills', 'fills.color'], paintIndex),
+          style: paintIndex === 0 ? fillStyle : null,
         });
       } else if (paint.type && paint.type.indexOf('GRADIENT') === 0) {
         source.gradients.push({
@@ -132,45 +453,82 @@ function collectDesignSource(node, source) {
           type: paint.type,
           nodeId: node.id,
           nodeName: node.name,
+          style: paintIndex === 0 ? fillStyle : null,
         });
       }
     });
   }
 
   const radius = getBorderRadiusCss(node);
-  if (radius) source.radii.push({ value: radius, nodeId: node.id, nodeName: node.name });
+  if (radius) {
+    source.radii.push({
+      value: radius,
+      nodeId: node.id,
+      nodeName: node.name,
+      variable: variableForField(info, [
+        'topLeftRadius',
+        'topRightRadius',
+        'bottomRightRadius',
+        'bottomLeftRadius',
+        'cornerRadius',
+      ]),
+    });
+  }
 
   const shadow = node.type === 'TEXT' ? getTextShadowCss(node) : getBoxShadowCss(node);
-  if (shadow) source.shadows.push({ value: shadow, nodeId: node.id, nodeName: node.name });
+  if (shadow) {
+    source.shadows.push({
+      value: shadow,
+      nodeId: node.id,
+      nodeName: node.name,
+      style: effectStyle,
+      variable: variableForField(info, ['effects.color', 'effects.radius', 'effects.spread']),
+    });
+  }
 
   if (node.layoutMode && node.layoutMode !== 'NONE') {
     [
-      node.itemSpacing,
-      node.counterAxisSpacing,
-      node.paddingTop,
-      node.paddingRight,
-      node.paddingBottom,
-      node.paddingLeft,
-      node.gridColumnGap,
-      node.gridRowGap,
-    ].forEach((value) => {
+      ['itemSpacing', node.itemSpacing],
+      ['counterAxisSpacing', node.counterAxisSpacing],
+      ['paddingTop', node.paddingTop],
+      ['paddingRight', node.paddingRight],
+      ['paddingBottom', node.paddingBottom],
+      ['paddingLeft', node.paddingLeft],
+      ['gridColumnGap', node.gridColumnGap],
+      ['gridRowGap', node.gridRowGap],
+    ].forEach(([field, value]) => {
       if (typeof value === 'number' && value > 0) {
-        source.spacing.push({ value: round(value), nodeId: node.id, nodeName: node.name });
+        source.spacing.push({
+          value: round(value),
+          field,
+          nodeId: node.id,
+          nodeName: node.name,
+          variable: variableForField(info, [field]),
+        });
       }
     });
   }
 
-  (node.children || []).forEach((child) => collectDesignSource(child, source));
+  (node.children || []).forEach((child) => collectDesignSource(child, source, bindings));
 }
 
+// A variable or style, when the node has one, wins over the value-derived name
+// and the value-derived identity — that is the whole point of reading them.
+// Without one, this behaves exactly as it did before.
 function aggregateTokens(items, keyFor, tokenFor) {
   const map = new Map();
   items.forEach((item) => {
-    const key = keyFor(item);
+    const key = sourceKey(item) || keyFor(item);
     if (!key) return;
     let entry = map.get(key);
     if (!entry) {
-      entry = { ...item, token: tokenFor(item), usageCount: 0, nodes: [] };
+      entry = {
+        ...item,
+        token: sourceToken(item) || tokenFor(item),
+        origin: item.variable ? 'variable' : item.style ? 'style' : 'value',
+        usageCount: 0,
+        nodes: [],
+      };
       map.set(key, entry);
     }
     entry.usageCount += 1;
@@ -212,6 +570,19 @@ async function getAvailableFontSet() {
   return availableFontsPromise;
 }
 
+// Variant values like "default" or "class" are perfectly good Figma names and
+// illegal Dart identifiers, so they get a suffix rather than emitting code that
+// will not compile.
+const DART_RESERVED_WORDS = new Set([
+  'abstract', 'as', 'assert', 'async', 'await', 'base', 'break', 'case', 'catch', 'class', 'const',
+  'continue', 'covariant', 'default', 'deferred', 'do', 'dynamic', 'else', 'enum', 'export',
+  'extends', 'extension', 'external', 'factory', 'false', 'final', 'finally', 'for', 'function',
+  'get', 'hide', 'if', 'implements', 'import', 'in', 'interface', 'is', 'late', 'library', 'mixin',
+  'new', 'null', 'on', 'operator', 'part', 'required', 'rethrow', 'return', 'sealed', 'set', 'show',
+  'static', 'super', 'switch', 'sync', 'this', 'throw', 'true', 'try', 'typedef', 'var', 'void',
+  'when', 'while', 'with', 'yield',
+]);
+
 function dartIdentifier(value) {
   const words = String(value || '')
     .replace(/[^a-zA-Z0-9]+/g, ' ')
@@ -225,14 +596,173 @@ function dartIdentifier(value) {
       .slice(1)
       .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
       .join('');
+  if (DART_RESERVED_WORDS.has(name)) return `${name}Value`;
   return /^[0-9]/.test(name) ? `token${name}` : name;
 }
 
+function pascalIdentifier(value) {
+  const words = String(value || '')
+    .replace(/[^a-zA-Z0-9]+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean);
+  if (words.length === 0) return 'Component';
+  const name = words.map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join('');
+  return /^[0-9]/.test(name) ? `C${name}` : name;
+}
+
 function dartColor(value) {
-  if (!value || value.charAt(0) !== '#') return null;
-  const hex = value.slice(1);
-  if (hex.length === 6) return `Color(0xFF${hex.toUpperCase()})`;
-  return null;
+  if (!value) return null;
+  if (value.charAt(0) === '#') {
+    const hex = value.slice(1);
+    if (hex.length === 6) return `Color(0xFF${hex.toUpperCase()})`;
+    return null;
+  }
+  const rgba = /^rgba\(\s*(\d+),\s*(\d+),\s*(\d+),\s*([0-9.]+)\s*\)$/.exec(value);
+  if (!rgba) return null;
+  const channel = (n) => Number(n).toString(16).padStart(2, '0').toUpperCase();
+  const alpha = channel(Math.round(Math.max(0, Math.min(1, parseFloat(rgba[4]))) * 255));
+  return `Color(0x${alpha}${channel(rgba[1])}${channel(rgba[2])}${channel(rgba[3])})`;
+}
+
+// A FLOAT variable can be a length (padding, radius, font size) or a bare ratio
+// (opacity) — the fields it is actually bound to are the only reliable way to
+// tell, so units come from there rather than from a guess about the name.
+const PX_FIELD_PATTERN = /padding|spacing|radius|gap|width|height|strokeWeight|fontSize|lineHeight|letterSpacing|paragraph/i;
+
+function variableCssValue(variable, mode) {
+  if (mode.aliasToken) return `var(--${mode.aliasToken})`;
+  if (mode.value === null || mode.value === undefined) return null;
+  if (variable.resolvedType === 'FLOAT') {
+    return variable.fields.some((field) => PX_FIELD_PATTERN.test(field)) ? `${mode.value}px` : String(mode.value);
+  }
+  return String(mode.value);
+}
+
+function buildVariableCssLines(variables) {
+  if (variables.length === 0) return [];
+  const lines = [];
+  const collections = new Map();
+  variables.forEach((variable) => {
+    const name = variable.collection || 'Variables';
+    if (!collections.has(name)) collections.set(name, []);
+    collections.get(name).push(variable);
+  });
+
+  collections.forEach((list, collectionName) => {
+    lines.push(`/* Figma variables — collection "${collectionName}" */`);
+    const defaults = [];
+    const modeNames = [];
+    list.forEach((variable) => {
+      variable.modeValues.forEach((mode) => {
+        if (modeNames.indexOf(mode.modeName) === -1) modeNames.push(mode.modeName);
+      });
+      const fallback = variable.modeValues.find((mode) => mode.isDefault) || variable.modeValues[0];
+      const value = fallback ? variableCssValue(variable, fallback) : null;
+      if (value !== null) defaults.push(`  --${variable.token}: ${value};`);
+    });
+    if (defaults.length > 0) lines.push(':root {', ...defaults, '}');
+
+    // A second mode is a theme — expose it as a data attribute on any ancestor
+    // instead of forcing a whole second stylesheet. Only tokens that actually
+    // differ from the default mode belong in it.
+    modeNames.forEach((modeName) => {
+      const overrides = [];
+      list.forEach((variable) => {
+        const mode = variable.modeValues.find((entry) => entry.modeName === modeName);
+        if (!mode || mode.isDefault) return;
+        const value = variableCssValue(variable, mode);
+        if (value === null) return;
+        const fallback = variable.modeValues.find((entry) => entry.isDefault) || variable.modeValues[0];
+        if (fallback && variableCssValue(variable, fallback) === value) return;
+        overrides.push(`  --${variable.token}: ${value};`);
+      });
+      if (overrides.length > 0) {
+        lines.push('', `[data-${slugToken(collectionName)}="${slugToken(modeName)}"] {`, ...overrides, '}');
+      }
+    });
+    lines.push('');
+  });
+  return lines;
+}
+
+function buildComponentExport(componentLibrary) {
+  if (componentLibrary.length === 0) {
+    return '// No component instances found in this selection.';
+  }
+  const totalInstances = componentLibrary.reduce((sum, component) => sum + component.usageCount, 0);
+  const lines = [
+    "import 'package:flutter/material.dart';",
+    '',
+    `// ${componentLibrary.length} component(s), ${totalInstances} instance(s) in this selection.`,
+    '// Scaffolds only — paste the generated Flutter/HTML output for each variant',
+    '// into the matching build method so every instance renders from one place.',
+  ];
+
+  componentLibrary.forEach((component) => {
+    const axes = Object.keys(component.variantAxes);
+    const propNames = Object.keys(component.properties).filter((name) => !axes.includes(name));
+    lines.push(
+      '',
+      `// ${component.name} — ${component.usageCount} instance(s)${component.remote ? ' (library component)' : ''}`
+    );
+    axes.forEach((axis) => {
+      lines.push(`//   ${axis}: ${component.variantAxes[axis].join(' | ')}`);
+    });
+    propNames.forEach((name) => {
+      lines.push(`//   ${name} (${component.properties[name].type})`);
+    });
+
+    const enums = new Map();
+    axes.forEach((axis) => {
+      const enumName = `${component.className}${pascalIdentifier(axis)}`;
+      const used = new Set();
+      const members = component.variantAxes[axis].map((value) => {
+        let member = dartIdentifier(value);
+        while (used.has(member)) member = `${member}_`;
+        used.add(member);
+        return member;
+      });
+      enums.set(axis, { enumName, members });
+      lines.push(`enum ${enumName} { ${members.join(', ')} }`);
+    });
+
+    const params = [];
+    const fields = [];
+    propNames.forEach((name) => {
+      const prop = component.properties[name];
+      const identifier = dartIdentifier(name);
+      if (prop.type === 'BOOLEAN') {
+        params.push(`    this.${identifier} = false,`);
+        fields.push(`  final bool ${identifier};`);
+      } else if (prop.type === 'INSTANCE_SWAP') {
+        params.push(`    this.${identifier},`);
+        fields.push(`  final Widget? ${identifier};`);
+      } else {
+        params.push(`    required this.${identifier},`);
+        fields.push(`  final String ${identifier};`);
+      }
+    });
+    axes.forEach((axis) => {
+      const info = enums.get(axis);
+      const identifier = dartIdentifier(axis);
+      params.push(`    this.${identifier} = ${info.enumName}.${info.members[0]},`);
+      fields.push(`  final ${info.enumName} ${identifier};`);
+    });
+
+    lines.push(`class ${component.className} extends StatelessWidget {`);
+    if (params.length === 0) {
+      lines.push(`  const ${component.className}({super.key});`);
+    } else {
+      lines.push(`  const ${component.className}({`, '    super.key,', ...params, '  });');
+    }
+    lines.push(...fields);
+    lines.push('', '  @override', '  Widget build(BuildContext context) {');
+    lines.push('    // TODO: paste the generated widget tree for this component here.');
+    lines.push('    return const SizedBox.shrink();', '  }', '}');
+  });
+
+  return lines.join('\n');
 }
 
 function buildDesignSystemExports(designSystem) {
@@ -246,14 +776,20 @@ function buildDesignSystemExports(designSystem) {
       );
     });
   });
-  cssLines.push('', ':root {');
+  cssLines.push('');
+  cssLines.push(...buildVariableCssLines(designSystem.variables));
+  cssLines.push(':root {');
   designSystem.typography.forEach((token) => {
     cssLines.push(`  --${token.token}-family: '${token.family}';`);
     if (token.fontSize !== null) cssLines.push(`  --${token.token}-size: ${token.fontSize}px;`);
     if (token.lineHeight) cssLines.push(`  --${token.token}-line-height: ${token.lineHeight};`);
     if (token.letterSpacing) cssLines.push(`  --${token.token}-letter-spacing: ${token.letterSpacing};`);
   });
-  designSystem.colors.forEach((token) => cssLines.push(`  --${token.token}: ${token.value};`));
+  // A variable-backed color is already declared (with all of its modes) in the
+  // variables block above — redeclaring it here would pin it to one mode.
+  designSystem.colors
+    .filter((token) => token.origin !== 'variable')
+    .forEach((token) => cssLines.push(`  --${token.token}: ${token.value};`));
   cssLines.push('}');
   designSystem.typography.forEach((token) => {
     cssLines.push(
@@ -266,7 +802,8 @@ function buildDesignSystemExports(designSystem) {
     if (token.fontSize !== null) cssLines.push(`  font-size: var(--${token.token}-size);`);
     if (token.lineHeight) cssLines.push(`  line-height: var(--${token.token}-line-height);`);
     if (token.letterSpacing) cssLines.push(`  letter-spacing: var(--${token.token}-letter-spacing);`);
-    if (token.color) cssLines.push(`  color: ${token.color};`);
+    if (token.colorToken) cssLines.push(`  color: var(--${token.colorToken});`);
+    else if (token.color) cssLines.push(`  color: ${token.color};`);
     cssLines.push('}');
   });
 
@@ -279,7 +816,52 @@ function buildDesignSystemExports(designSystem) {
     '    useMaterial3: true,',
   ];
   if (defaultFamily) flutterLines.push(`    fontFamily: '${defaultFamily.replace(/'/g, "\\'")}',`);
-  flutterLines.push('  );', '}', '', 'abstract final class AppTypography {');
+  flutterLines.push('  );', '}');
+
+  // Variable-backed tokens keep the designer's own names, which is what makes
+  // the generated theme reviewable against Figma instead of a wall of hexes.
+  const colorVariables = designSystem.variables.filter((variable) => variable.resolvedType === 'COLOR');
+  if (colorVariables.length > 0) {
+    flutterLines.push('', 'abstract final class AppColors {');
+    colorVariables.forEach((variable) => {
+      const defaultMode = variable.modeValues.find((mode) => mode.isDefault) || variable.modeValues[0];
+      if (!defaultMode) return;
+      if (defaultMode.aliasToken) {
+        flutterLines.push(`  static const ${dartIdentifier(variable.token)} = ${dartIdentifier(defaultMode.aliasToken)};`);
+        return;
+      }
+      const color = dartColor(defaultMode.value);
+      if (color) flutterLines.push(`  static const ${dartIdentifier(variable.token)} = ${color};`);
+      const others = variable.modeValues.filter((mode) => !mode.isDefault);
+      others.forEach((mode) => {
+        const modeColor = dartColor(mode.value);
+        if (modeColor) {
+          flutterLines.push(
+            `  static const ${dartIdentifier(`${variable.token}-${mode.modeName}`)} = ${modeColor}; // mode: ${mode.modeName}`
+          );
+        }
+      });
+    });
+    flutterLines.push('}');
+  }
+
+  const numberVariables = designSystem.variables.filter(
+    (variable) =>
+      variable.resolvedType === 'FLOAT' && variable.fields.some((field) => PX_FIELD_PATTERN.test(field))
+  );
+  if (numberVariables.length > 0) {
+    flutterLines.push('', 'abstract final class AppSpacing {');
+    numberVariables.forEach((variable) => {
+      const defaultMode = variable.modeValues.find((mode) => mode.isDefault) || variable.modeValues[0];
+      if (!defaultMode || typeof defaultMode.value !== 'number') return;
+      // Typed as double on purpose: an untyped `= 16` is an int const, and Dart
+      // will not implicitly widen it where a double is expected.
+      flutterLines.push(`  static const double ${dartIdentifier(variable.token)} = ${defaultMode.value};`);
+    });
+    flutterLines.push('}');
+  }
+
+  flutterLines.push('', 'abstract final class AppTypography {');
   designSystem.typography.forEach((token) => {
     flutterLines.push(`  static const ${dartIdentifier(token.token)} = TextStyle(`);
     flutterLines.push(`    fontFamily: '${token.family.replace(/'/g, "\\'")}',`);
@@ -316,16 +898,21 @@ function buildDesignSystemExports(designSystem) {
   return {
     css: cssLines.join('\n'),
     flutter: flutterLines.join('\n'),
+    components: buildComponentExport(designSystem.componentLibrary),
     json: JSON.stringify(
       {
         name: designSystem.name,
+        coverage: designSystem.coverage,
         fonts: designSystem.fonts,
+        variables: designSystem.variables,
+        styles: designSystem.styles,
         typography: designSystem.typography,
         colors: designSystem.colors,
         gradients: designSystem.gradients,
         radii: designSystem.radii,
         shadows: designSystem.shadows,
         spacing: designSystem.spacing,
+        componentLibrary: designSystem.componentLibrary,
         components: designSystem.components,
       },
       null,
@@ -334,9 +921,21 @@ function buildDesignSystemExports(designSystem) {
   };
 }
 
-async function buildDesignSystem(node) {
-  const source = { textRuns: [], colors: [], gradients: [], radii: [], shadows: [], spacing: [] };
-  collectDesignSource(node, source);
+// Accepts one node or a whole multi-selection — a design system is only really
+// meaningful across everything the user picked, not one frame at a time.
+async function buildDesignSystem(input, prebuiltBindings) {
+  const nodes = Array.isArray(input) ? input.filter(Boolean) : input ? [input] : [];
+  const source = {
+    textRuns: [],
+    colors: [],
+    gradients: [],
+    radii: [],
+    shadows: [],
+    spacing: [],
+    instances: [],
+  };
+  const bindings = prebuiltBindings || (await buildBindingIndex(nodes));
+  nodes.forEach((node) => collectDesignSource(node, source, bindings));
   const available = await getAvailableFontSet();
 
   const typography = uniquifyTokenNames(aggregateTokens(
@@ -438,8 +1037,32 @@ async function buildDesignSystem(node) {
   shadows.forEach((token) => addUsage(token, 'shadows'));
   spacing.forEach((token) => addUsage(token, 'spacing'));
 
+  // Let a type style point at the color token instead of restating the hex, so
+  // the exported CSS/theme has one source of truth per color.
+  const colorTokenByValue = new Map();
+  colors.forEach((token) => {
+    if (!colorTokenByValue.has(token.value)) colorTokenByValue.set(token.value, token);
+  });
+  typography.forEach((token) => {
+    const colorToken = token.color ? colorTokenByValue.get(token.color) : null;
+    token.colorToken = colorToken && colorToken.origin !== 'value' ? colorToken.token : null;
+  });
+
+  const variables = collectUsedVariables(bindings);
+  const styles = collectUsedStyles(bindings);
+  const componentLibrary = buildComponentLibrary(source.instances);
+
+  const tokenized = [].concat(typography, colors, gradients, radii, shadows, spacing);
+  const boundCount = tokenized.filter((token) => token.origin !== 'value').length;
+  const coverage = {
+    total: tokenized.length,
+    bound: boundCount,
+    unbound: tokenized.length - boundCount,
+    ratio: tokenized.length === 0 ? 0 : round((boundCount / tokenized.length) * 100),
+  };
+
   const designSystem = {
-    name: node.name,
+    name: nodes.length === 1 ? nodes[0].name : `${nodes.length} selected layers`,
     fonts,
     typography,
     colors,
@@ -447,10 +1070,110 @@ async function buildDesignSystem(node) {
     radii,
     shadows,
     spacing,
+    variables,
+    styles,
+    componentLibrary,
+    coverage,
     components: Array.from(componentMap.values()),
   };
   designSystem.exports = buildDesignSystemExports(designSystem);
   return designSystem;
+}
+
+function collectUsedVariables(bindings) {
+  const map = new Map();
+  bindings.forEach((info, nodeId) => {
+    info.variables.forEach((entry) => {
+      let variable = map.get(entry.id);
+      if (!variable) {
+        variable = {
+          id: entry.id,
+          name: entry.name,
+          token: entry.token,
+          resolvedType: entry.resolvedType,
+          collection: entry.collection,
+          collectionId: entry.collectionId,
+          remote: entry.remote,
+          modeValues: entry.modeValues,
+          fields: [],
+          usageCount: 0,
+          nodes: [],
+        };
+        map.set(entry.id, variable);
+      }
+      variable.usageCount += 1;
+      if (variable.fields.indexOf(entry.field) === -1) variable.fields.push(entry.field);
+      if (variable.nodes.indexOf(nodeId) === -1) variable.nodes.push(nodeId);
+    });
+  });
+  return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function collectUsedStyles(bindings) {
+  const map = new Map();
+  bindings.forEach((info, nodeId) => {
+    info.styles.forEach((entry) => {
+      let style = map.get(entry.id);
+      if (!style) {
+        style = { ...entry, roles: [], usageCount: 0, nodes: [] };
+        delete style.role;
+        map.set(entry.id, style);
+      }
+      style.usageCount += 1;
+      if (style.roles.indexOf(entry.role) === -1) style.roles.push(entry.role);
+      if (style.nodes.indexOf(nodeId) === -1) style.nodes.push(nodeId);
+    });
+  });
+  return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// Groups instances back into the component (or component set) they came from, so
+// twelve buttons on a screen read as one component used twelve ways instead of
+// twelve unrelated frames.
+function buildComponentLibrary(instances) {
+  const map = new Map();
+  instances.forEach((instance) => {
+    const key = instance.setId || instance.componentId || instance.componentName;
+    if (!key) return;
+    let component = map.get(key);
+    if (!component) {
+      component = {
+        key,
+        name: instance.componentName,
+        className: pascalIdentifier(instance.componentName),
+        componentKey: instance.componentKey,
+        remote: instance.remote,
+        isVariantSet: !!instance.setId,
+        variantAxes: {},
+        properties: {},
+        instances: [],
+        usageCount: 0,
+      };
+      map.set(key, component);
+    }
+    component.usageCount += 1;
+    component.instances.push({
+      nodeId: instance.instanceId,
+      nodeName: instance.instanceName,
+      variantName: instance.variantName,
+      variantProperties: instance.variantProperties,
+      properties: instance.properties,
+    });
+    Object.keys(instance.variantProperties).forEach((axis) => {
+      if (!component.variantAxes[axis]) component.variantAxes[axis] = [];
+      const value = instance.variantProperties[axis];
+      if (component.variantAxes[axis].indexOf(value) === -1) component.variantAxes[axis].push(value);
+    });
+    Object.keys(instance.properties).forEach((name) => {
+      const prop = instance.properties[name];
+      if (!component.properties[name]) component.properties[name] = { type: prop.type, values: [] };
+      const value = String(prop.value);
+      if (component.properties[name].values.indexOf(value) === -1) {
+        component.properties[name].values.push(value);
+      }
+    });
+  });
+  return Array.from(map.values()).sort((a, b) => b.usageCount - a.usageCount);
 }
 
 // ---------- CSS extraction ----------
@@ -1835,7 +2558,7 @@ async function generateHtml(node) {
 
 // ---------- Compact JSON for AI ----------
 
-function buildCompactNode(node) {
+function buildCompactNode(node, bindings) {
   const compact = {
     id: node.id,
     type: node.type,
@@ -1843,6 +2566,15 @@ function buildCompactNode(node) {
     width: round(node.width),
     height: round(node.height),
   };
+
+  const info = bindings ? bindings.get(node.id) || null : null;
+  if (info) {
+    if (info.component) compact.component = info.component;
+    if (info.styles.length > 0) compact.styles = info.styles.map((style) => ({ role: style.role, name: style.name }));
+    if (info.variables.length > 0) {
+      compact.variables = info.variables.map((variable) => ({ field: variable.field, name: variable.name }));
+    }
+  }
 
   const fill = getSolidFill(node);
   if (fill && fill.color) compact.fill = rgbToHex(fill.color, fill.opacity);
@@ -1906,7 +2638,7 @@ function buildCompactNode(node) {
   if (visibleChildren.length > 0) {
     const isAutoLayout = node.layoutMode && node.layoutMode !== 'NONE';
     compact.children = visibleChildren.map((child) => {
-      const childCompact = buildCompactNode(child);
+      const childCompact = buildCompactNode(child, bindings);
       // Non-auto-layout parents position children freely by x/y (can overlap).
       // Even inside an auto-layout parent, a child can be individually flagged
       // "Absolute position" in Figma to float free of the flex flow (overlays,
@@ -1967,13 +2699,13 @@ async function exportPreviewPng(node) {
 
 // Dumps as much of the real figma.* node data as JSON allows — every raw fill/
 // stroke/effect/layout property, not just what CSS/Dart/HTML happen to need.
-// This is what the "Send to Claude (debug)" button ships, so debugging a
+// This is what the debug "Connect" button ships, so debugging a
 // mismatch doesn't depend on guessing which property to ask the user to check.
 function safeMixed(value) {
   return value === figma.mixed ? 'MIXED' : value;
 }
 
-function buildRawNode(node) {
+function buildRawNode(node, bindings) {
   const raw = {
     id: node.id,
     name: node.name,
@@ -2074,38 +2806,48 @@ function buildRawNode(node) {
     raw.textAlignVertical = node.textAlignVertical;
   }
 
+  const info = bindings ? bindings.get(node.id) || null : null;
+  if (info) {
+    if (info.component) raw.component = info.component;
+    if (info.styles.length > 0) raw.styles = info.styles;
+    if (info.variables.length > 0) {
+      raw.boundVariables = info.variables.map((variable) => ({
+        field: variable.field,
+        index: variable.index,
+        name: variable.name,
+        token: variable.token,
+        resolvedType: variable.resolvedType,
+        collection: variable.collection,
+      }));
+    }
+  }
+
   if (node.children && node.children.length > 0) {
-    raw.children = node.children.map(buildRawNode);
+    raw.children = node.children.map((child) => buildRawNode(child, bindings));
   }
 
   return raw;
 }
 
-async function buildPayload(node) {
+async function buildNodePayload(node, bindings, extraWarnings) {
   const { css, warnings } = extractCss(node);
   const dart = await generateDart(node);
   const htmlResult = await generateHtml(node);
-  const compact = buildCompactNode(node);
-  const designSystem = await buildDesignSystem(node);
+  const compact = buildCompactNode(node, bindings);
   const preview = await exportPreviewPng(node);
-  const raw = buildRawNode(node);
+  const raw = buildRawNode(node, bindings);
 
   // Caveats from anywhere in the subtree matter just as much as ones on the
   // selected node itself — a flattened child is exactly what makes a preview
   // stop matching the design.
-  const fontWarnings = designSystem.fonts
-    .filter((font) => font.available === false)
-    .map(
-      (font) =>
-        `"${font.family}": one or more font styles are unavailable in Figma; HTML/Flutter will fall back until the font files are installed`
-    );
   const allWarnings = warnings
-    .concat(htmlResult.warnings, fontWarnings)
+    .concat(htmlResult.warnings, extraWarnings || [])
     .filter((w, i, a) => a.indexOf(w) === i);
 
   return {
-    type: 'selection',
+    nodeId: node.id,
     nodeName: node.name,
+    nodeType: node.type,
     width: round(node.width),
     height: round(node.height),
     css,
@@ -2113,10 +2855,45 @@ async function buildPayload(node) {
     dart,
     html: htmlResult.html,
     compact,
-    designSystem,
     previewImage: preview ? preview.uri : null,
     previewCrop: preview ? preview.crop : null,
     raw,
+  };
+}
+
+// Generating code for every node of a huge multi-selection means one PNG export
+// and one full subtree walk each — past this many, the design system still
+// covers everything selected but per-node code stops at the cap.
+const MAX_CODE_NODES = 8;
+
+async function buildSelectionPayload(nodes) {
+  // One binding pre-pass for the whole selection: the async variable/style/
+  // component lookups are cached across every node, so a 20-layer selection
+  // resolves each shared token exactly once.
+  const bindings = await buildBindingIndex(nodes);
+  const designSystem = await buildDesignSystem(nodes, bindings);
+
+  const fontWarnings = designSystem.fonts
+    .filter((font) => font.available === false)
+    .map(
+      (font) =>
+        `"${font.family}": one or more font styles are unavailable in Figma; HTML/Flutter will fall back until the font files are installed`
+    );
+
+  const coded = nodes.slice(0, MAX_CODE_NODES);
+  const payloads = [];
+  for (const node of coded) {
+    payloads.push(await buildNodePayload(node, bindings, fontWarnings));
+  }
+
+  return {
+    type: 'selection',
+    nodeName: payloads.length > 0 ? payloads[0].nodeName : '',
+    selectionCount: nodes.length,
+    skippedCount: Math.max(0, nodes.length - coded.length),
+    skippedNames: nodes.slice(coded.length).map((node) => node.name),
+    nodes: payloads,
+    designSystem,
   };
 }
 
@@ -2127,13 +2904,19 @@ let selectionGeneration = 0;
 
 async function sendSelection() {
   const generation = ++selectionGeneration;
+  // Variables and styles are editable while the plugin is open, so resolve them
+  // fresh per selection rather than serving a rename from cache. The cache still
+  // does its job *within* one selection, where the same token is hit repeatedly.
+  variableCache.clear();
+  variableCollectionCache.clear();
+  figmaStyleCache.clear();
   const selection = figma.currentPage.selection;
   if (selection.length === 0) {
     figma.ui.postMessage({ type: 'empty' });
     return;
   }
   try {
-    const payload = await buildPayload(selection[0]);
+    const payload = await buildSelectionPayload(selection.slice());
     if (generation === selectionGeneration) {
       figma.ui.postMessage(payload);
     }

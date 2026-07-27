@@ -6,6 +6,41 @@ const vm = require('node:vm');
 const projectRoot = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(projectRoot, 'code.js'), 'utf8');
 const mixed = Symbol('figma.mixed');
+
+// Stand-ins for the async variable/style APIs, so the token names the plugin
+// reports can be checked against the names a designer would have given them.
+const themeCollection = {
+  id: 'coll:theme',
+  name: 'Theme',
+  defaultModeId: 'mode:light',
+  modes: [
+    { modeId: 'mode:light', name: 'Light' },
+    { modeId: 'mode:dark', name: 'Dark' },
+  ],
+};
+const fakeVariables = {
+  'var:brand': {
+    id: 'var:brand',
+    name: 'color/brand/primary',
+    resolvedType: 'COLOR',
+    variableCollectionId: 'coll:theme',
+    valuesByMode: {
+      'mode:light': { r: 0, g: 0.5019607843, b: 1, a: 1 },
+      'mode:dark': { r: 1, g: 1, b: 1, a: 1 },
+    },
+  },
+  'var:space': {
+    id: 'var:space',
+    name: 'space/md',
+    resolvedType: 'FLOAT',
+    variableCollectionId: 'coll:theme',
+    valuesByMode: { 'mode:light': 16, 'mode:dark': 16 },
+  },
+};
+const fakeStyles = {
+  'style:heading': { id: 'style:heading', name: 'Heading/H1', type: 'TEXT' },
+};
+
 const context = {
   __html__: '',
   console,
@@ -18,6 +53,17 @@ const context = {
     currentPage: { selection: [] },
     ui: { postMessage() {} },
     on() {},
+    variables: {
+      async getVariableByIdAsync(id) {
+        return fakeVariables[id] || null;
+      },
+      async getVariableCollectionByIdAsync(id) {
+        return id === themeCollection.id ? themeCollection : null;
+      },
+    },
+    async getStyleByIdAsync(id) {
+      return fakeStyles[id] || null;
+    },
   },
 };
 
@@ -377,6 +423,164 @@ async function run() {
   assert.match(assetDart, /import 'dart:convert';/);
   assert.match(assetDart, /Widget buildIcon\(\)/);
   assert.match(assetDart, /Image\.memory\(base64Decode\('BASE64_DATA'\)/);
+
+  // --- Variables, styles, and component instances ---
+
+  const buttonComponent = {
+    id: 'component:button-md',
+    name: 'Size=md, State=default',
+    key: 'component-key-1',
+    remote: true,
+    variantProperties: { Size: 'md', State: 'default' },
+    parent: { id: 'set:button', type: 'COMPONENT_SET', name: 'Button' },
+  };
+  const buttonInstance = {
+    id: 'instance:button',
+    type: 'INSTANCE',
+    name: 'Button',
+    width: 120,
+    height: 40,
+    opacity: 1,
+    visible: true,
+    fills: [],
+    strokes: [],
+    effects: [],
+    children: [],
+    variantProperties: { Size: 'md', State: 'default' },
+    componentProperties: {
+      'Label#1:0': { type: 'TEXT', value: 'Save' },
+      'Show icon#2:0': { type: 'BOOLEAN', value: true },
+    },
+    async getMainComponentAsync() {
+      return buttonComponent;
+    },
+  };
+  const headingText = {
+    id: 'text:heading',
+    type: 'TEXT',
+    name: 'Title',
+    width: 200,
+    height: 24,
+    opacity: 1,
+    visible: true,
+    characters: 'Dashboard',
+    fontSize: 20,
+    fontName: { family: 'Example Sans', style: 'Bold' },
+    fills: [solid(0.1, 0.1, 0.1)],
+    strokes: [],
+    effects: [],
+    textStyleId: 'style:heading',
+  };
+  const tokenizedCard = {
+    id: 'frame:tokenized-card',
+    type: 'FRAME',
+    name: 'Card',
+    width: 320,
+    height: 120,
+    opacity: 1,
+    visible: true,
+    layoutMode: 'VERTICAL',
+    itemSpacing: 16,
+    paddingTop: 16,
+    paddingRight: 16,
+    paddingBottom: 16,
+    paddingLeft: 16,
+    fills: [solid(0, 0.5019607843, 1)],
+    strokes: [],
+    effects: [],
+    boundVariables: {
+      fills: [{ type: 'VARIABLE_ALIAS', id: 'var:brand' }],
+      itemSpacing: { type: 'VARIABLE_ALIAS', id: 'var:space' },
+    },
+    children: [headingText, buttonInstance],
+  };
+
+  const tokenized = await api.buildDesignSystem(tokenizedCard);
+
+  // A fill bound to a variable is named after the variable, not its hex.
+  const brandColor = tokenized.colors.find((token) => token.token === 'color-brand-primary');
+  assert.ok(brandColor, 'expected the bound fill to be named after its variable');
+  assert.equal(brandColor.origin, 'variable');
+  assert.equal(brandColor.value, '#0080ff');
+
+  const spaceToken = tokenized.spacing.find((token) => token.token === 'space-md');
+  assert.ok(spaceToken, 'expected itemSpacing to resolve to its bound variable');
+  assert.equal(spaceToken.origin, 'variable');
+
+  // A text style gives the type token its name too.
+  const headingToken = tokenized.typography.find((token) => token.token === 'heading-h1');
+  assert.ok(headingToken, 'expected the applied text style to name the type token');
+  assert.equal(headingToken.origin, 'style');
+  assert.equal(tokenized.styles[0].name, 'Heading/H1');
+  assert.equal(tokenized.styles[0].roles.join(','), 'text');
+
+  assert.equal(tokenized.variables.length, 2);
+  const brandVariable = tokenized.variables.find((variable) => variable.name === 'color/brand/primary');
+  assert.equal(brandVariable.collection, 'Theme');
+  assert.equal(brandVariable.modeValues.length, 2);
+  assert.equal(brandVariable.modeValues.find((mode) => mode.isDefault).value, '#0080ff');
+  assert.equal(brandVariable.modeValues.find((mode) => mode.modeName === 'Dark').value, '#ffffff');
+  assert.ok(tokenized.coverage.bound >= 3, 'expected variable/style-backed tokens to count as bound');
+  assert.ok(tokenized.coverage.ratio > 0);
+
+  // Instances collapse back into the component they came from, with their axes.
+  assert.equal(tokenized.componentLibrary.length, 1);
+  const buttonEntry = tokenized.componentLibrary[0];
+  assert.equal(buttonEntry.name, 'Button');
+  assert.equal(buttonEntry.className, 'Button');
+  assert.equal(buttonEntry.usageCount, 1);
+  assert.equal(buttonEntry.variantAxes.Size.join(','), 'md');
+  assert.equal(Object.keys(buttonEntry.properties).sort().join(','), 'Label,Show icon');
+
+  // Exports carry the same names through to CSS/Dart.
+  assert.match(tokenized.exports.css, /--color-brand-primary: #0080ff;/);
+  assert.match(tokenized.exports.css, /\[data-theme="dark"\] \{/);
+  assert.match(tokenized.exports.css, /--space-md: 16px;/);
+  // The variable already declares it per mode — the derived block must not pin it.
+  assert.doesNotMatch(tokenized.exports.css, /--color-0080ff:/);
+  assert.match(tokenized.exports.flutter, /abstract final class AppColors/);
+  assert.match(tokenized.exports.flutter, /colorBrandPrimary = Color\(0xFF0080FF\)/);
+  assert.match(tokenized.exports.flutter, /abstract final class AppSpacing/);
+  // 16px in both modes — the dark block must not restate what it does not change.
+  assert.doesNotMatch(tokenized.exports.css, /\[data-theme="dark"\] \{\n  --space-md/);
+  assert.match(tokenized.exports.flutter, /static const double spaceMd = 16;/);
+  assert.match(tokenized.exports.components, /enum ButtonSize \{ md \}/);
+  // "default" is a Dart keyword, so the variant value cannot be used verbatim.
+  assert.match(tokenized.exports.components, /enum ButtonState \{ defaultValue \}/);
+  assert.match(tokenized.exports.components, /class Button extends StatelessWidget/);
+  assert.match(tokenized.exports.components, /required this\.label,/);
+
+  // Codegen itself is untouched by any of the above.
+  const tokenizedCss = api.extractCss(tokenizedCard).css;
+  assert.equal(tokenizedCss.display, 'flex');
+  assert.match(tokenizedCss.background, /#0080ff/);
+
+  // --- Multi-selection ---
+
+  const plainCard = {
+    ...tokenizedCard,
+    id: 'frame:plain-card',
+    name: 'Plain Card',
+    boundVariables: undefined,
+    fills: [solid(1, 1, 1)],
+    children: [italicText],
+  };
+  const combined = await api.buildDesignSystem([tokenizedCard, plainCard]);
+  assert.equal(combined.name, '2 selected layers');
+  assert.ok(combined.colors.some((token) => token.token === 'color-brand-primary'));
+  assert.ok(combined.colors.some((token) => token.token === 'color-ffffff'));
+  assert.equal(combined.componentLibrary.length, 1);
+  assert.ok(
+    combined.typography.length >= 2,
+    'expected type styles from both selected layers to be merged'
+  );
+
+  // A file with no variables or styles at all still behaves exactly as before.
+  const untokenized = await api.buildDesignSystem(italicText);
+  assert.equal(untokenized.variables.length, 0);
+  assert.equal(untokenized.styles.length, 0);
+  assert.equal(untokenized.coverage.bound, 0);
+  assert.equal(untokenized.typography[0].origin, 'value');
 
   console.log('code regression tests passed');
 }
