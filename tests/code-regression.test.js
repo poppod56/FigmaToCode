@@ -33,6 +33,7 @@ globalThis.__testApi = {
   generateHtml,
   generateDartForNode,
   generateDart,
+  buildDesignSystem,
 };`,
   context,
   { filename: 'code.js' }
@@ -299,6 +300,17 @@ async function run() {
   assert.match(italicDart, /fontFamily: 'Example Sans'/);
   assert.match(italicDart, /fontWeight: FontWeight\.w600/);
   assert.match(italicDart, /fontStyle: FontStyle\.italic/);
+
+  const designSystem = await api.buildDesignSystem(italicText);
+  assert.equal(designSystem.fonts[0].family, 'Example Sans');
+  assert.equal(designSystem.fonts[0].styles[0].weight, 600);
+  assert.equal(designSystem.typography[0].fontStyle, 'italic');
+  assert.equal(designSystem.components[0].nodeId, 'text:italic');
+  assert.match(designSystem.exports.css, /@font-face/);
+  assert.match(designSystem.exports.css, /font-weight: 600/);
+  assert.match(designSystem.exports.flutter, /abstract final class AppTypography/);
+  assert.match(designSystem.exports.flutter, /FontWeight\.w600/);
+  assert.match(designSystem.exports.json, /"typography"/);
 
   const gridDart = api.generateDartForNode(quickGuidesGrid, 0, new Map());
   assert.match(gridDart, /Stack\(/);

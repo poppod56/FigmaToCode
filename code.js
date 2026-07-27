@@ -36,6 +36,423 @@ function mapFontStyle(style) {
   return null;
 }
 
+// ---------- Design system extraction ----------
+
+function slugToken(value) {
+  const slug = String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '');
+  return slug || 'token';
+}
+
+function textMetricValue(value) {
+  if (!value || value === figma.mixed) return null;
+  if (value.unit === 'PIXELS') return `${round(value.value)}px`;
+  if (value.unit === 'PERCENT') return `${round(value.value)}%`;
+  if (value.unit === 'INTRINSIC_%') return `${round(value.value)}%`;
+  if (value.unit === 'AUTO') return 'auto';
+  return null;
+}
+
+function firstSolidPaintHex(paints) {
+  if (!paints || paints === figma.mixed) return null;
+  const paint = paints.find((item) => item.visible !== false && item.type === 'SOLID');
+  return paint ? rgbToHex(paint.color, paint.opacity !== undefined ? paint.opacity : 1) : null;
+}
+
+function getTextStyleRuns(node) {
+  if (node.type !== 'TEXT') return [];
+  const fallback = {
+    fontName: node.fontName,
+    fontSize: node.fontSize,
+    fills: node.fills,
+    letterSpacing: node.letterSpacing,
+    lineHeight: node.lineHeight,
+    characters: node.characters || '',
+  };
+
+  const hasMixed =
+    node.fontName === figma.mixed ||
+    node.fontSize === figma.mixed ||
+    node.fills === figma.mixed ||
+    node.letterSpacing === figma.mixed ||
+    node.lineHeight === figma.mixed;
+  if (!hasMixed || typeof node.getStyledTextSegments !== 'function') return [fallback];
+
+  try {
+    const segments = node.getStyledTextSegments([
+      'fontName',
+      'fontSize',
+      'fills',
+      'letterSpacing',
+      'lineHeight',
+    ]);
+    return segments && segments.length > 0 ? segments : [fallback];
+  } catch (e) {
+    return [fallback];
+  }
+}
+
+function collectDesignSource(node, source) {
+  if (!node || node.visible === false) return;
+
+  if (node.type === 'TEXT') {
+    getTextStyleRuns(node).forEach((run) => {
+      if (!run.fontName || run.fontName === figma.mixed) return;
+      source.textRuns.push({
+        nodeId: node.id,
+        nodeName: node.name,
+        family: run.fontName.family,
+        figmaStyle: run.fontName.style,
+        weight: mapFontWeight(run.fontName.style),
+        fontStyle: mapFontStyle(run.fontName.style) || 'normal',
+        fontSize: run.fontSize !== undefined && run.fontSize !== figma.mixed ? round(run.fontSize) : null,
+        lineHeight: textMetricValue(run.lineHeight),
+        letterSpacing: textMetricValue(run.letterSpacing),
+        color: firstSolidPaintHex(run.fills),
+        sample: String(run.characters || node.characters || '').slice(0, 80),
+      });
+    });
+  }
+
+  if (node.fills && node.fills !== figma.mixed) {
+    node.fills.forEach((paint) => {
+      if (paint.visible === false) return;
+      if (paint.type === 'SOLID') {
+        source.colors.push({
+          value: rgbToHex(paint.color, paint.opacity !== undefined ? paint.opacity : 1),
+          nodeId: node.id,
+          nodeName: node.name,
+          role: node.type === 'TEXT' ? 'text' : 'fill',
+        });
+      } else if (paint.type && paint.type.indexOf('GRADIENT') === 0) {
+        source.gradients.push({
+          value: fillToBackgroundLayer(paint),
+          type: paint.type,
+          nodeId: node.id,
+          nodeName: node.name,
+        });
+      }
+    });
+  }
+
+  const radius = getBorderRadiusCss(node);
+  if (radius) source.radii.push({ value: radius, nodeId: node.id, nodeName: node.name });
+
+  const shadow = node.type === 'TEXT' ? getTextShadowCss(node) : getBoxShadowCss(node);
+  if (shadow) source.shadows.push({ value: shadow, nodeId: node.id, nodeName: node.name });
+
+  if (node.layoutMode && node.layoutMode !== 'NONE') {
+    [
+      node.itemSpacing,
+      node.counterAxisSpacing,
+      node.paddingTop,
+      node.paddingRight,
+      node.paddingBottom,
+      node.paddingLeft,
+      node.gridColumnGap,
+      node.gridRowGap,
+    ].forEach((value) => {
+      if (typeof value === 'number' && value > 0) {
+        source.spacing.push({ value: round(value), nodeId: node.id, nodeName: node.name });
+      }
+    });
+  }
+
+  (node.children || []).forEach((child) => collectDesignSource(child, source));
+}
+
+function aggregateTokens(items, keyFor, tokenFor) {
+  const map = new Map();
+  items.forEach((item) => {
+    const key = keyFor(item);
+    if (!key) return;
+    let entry = map.get(key);
+    if (!entry) {
+      entry = { ...item, token: tokenFor(item), usageCount: 0, nodes: [] };
+      map.set(key, entry);
+    }
+    entry.usageCount += 1;
+    if (!entry.nodes.some((node) => node.id === item.nodeId)) {
+      entry.nodes.push({ id: item.nodeId, name: item.nodeName });
+    }
+  });
+  return Array.from(map.values());
+}
+
+function uniquifyTokenNames(tokens) {
+  const counts = new Map();
+  tokens.forEach((token) => {
+    const count = (counts.get(token.token) || 0) + 1;
+    counts.set(token.token, count);
+    if (count > 1) token.token = `${token.token}-${count}`;
+  });
+  return tokens;
+}
+
+let availableFontsPromise = null;
+
+async function getAvailableFontSet() {
+  if (!figma.listAvailableFontsAsync) return null;
+  if (!availableFontsPromise) {
+    availableFontsPromise = figma
+      .listAvailableFontsAsync()
+      .then(
+        (fonts) =>
+          new Set(
+            fonts.map((entry) => {
+              const fontName = entry.fontName || entry;
+              return `${fontName.family}\u0000${fontName.style}`;
+            })
+          )
+      )
+      .catch(() => null);
+  }
+  return availableFontsPromise;
+}
+
+function dartIdentifier(value) {
+  const words = String(value || '')
+    .replace(/[^a-zA-Z0-9]+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean);
+  if (words.length === 0) return 'token';
+  const name =
+    words[0].toLowerCase() +
+    words
+      .slice(1)
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+      .join('');
+  return /^[0-9]/.test(name) ? `token${name}` : name;
+}
+
+function dartColor(value) {
+  if (!value || value.charAt(0) !== '#') return null;
+  const hex = value.slice(1);
+  if (hex.length === 6) return `Color(0xFF${hex.toUpperCase()})`;
+  return null;
+}
+
+function buildDesignSystemExports(designSystem) {
+  const cssLines = ['/* Add licensed font files before using these placeholders. */'];
+  designSystem.fonts.forEach((font) => {
+    font.styles.forEach((style) => {
+      cssLines.push(
+        `/* @font-face { font-family: '${font.family}'; font-style: ${style.fontStyle}; font-weight: ${style.weight}; src: url('./fonts/${slugToken(
+          font.family
+        )}-${slugToken(style.figmaStyle)}.woff2') format('woff2'); } */`
+      );
+    });
+  });
+  cssLines.push('', ':root {');
+  designSystem.typography.forEach((token) => {
+    cssLines.push(`  --${token.token}-family: '${token.family}';`);
+    if (token.fontSize !== null) cssLines.push(`  --${token.token}-size: ${token.fontSize}px;`);
+    if (token.lineHeight) cssLines.push(`  --${token.token}-line-height: ${token.lineHeight};`);
+    if (token.letterSpacing) cssLines.push(`  --${token.token}-letter-spacing: ${token.letterSpacing};`);
+  });
+  designSystem.colors.forEach((token) => cssLines.push(`  --${token.token}: ${token.value};`));
+  cssLines.push('}');
+  designSystem.typography.forEach((token) => {
+    cssLines.push(
+      '',
+      `.${token.token} {`,
+      `  font-family: var(--${token.token}-family);`,
+      `  font-weight: ${token.weight};`,
+      `  font-style: ${token.fontStyle};`
+    );
+    if (token.fontSize !== null) cssLines.push(`  font-size: var(--${token.token}-size);`);
+    if (token.lineHeight) cssLines.push(`  line-height: var(--${token.token}-line-height);`);
+    if (token.letterSpacing) cssLines.push(`  letter-spacing: var(--${token.token}-letter-spacing);`);
+    if (token.color) cssLines.push(`  color: ${token.color};`);
+    cssLines.push('}');
+  });
+
+  const defaultFamily = designSystem.fonts.length > 0 ? designSystem.fonts[0].family : null;
+  const flutterLines = [
+    "import 'package:flutter/material.dart';",
+    '',
+    'ThemeData buildAppTheme() {',
+    '  return ThemeData(',
+    '    useMaterial3: true,',
+  ];
+  if (defaultFamily) flutterLines.push(`    fontFamily: '${defaultFamily.replace(/'/g, "\\'")}',`);
+  flutterLines.push('  );', '}', '', 'abstract final class AppTypography {');
+  designSystem.typography.forEach((token) => {
+    flutterLines.push(`  static const ${dartIdentifier(token.token)} = TextStyle(`);
+    flutterLines.push(`    fontFamily: '${token.family.replace(/'/g, "\\'")}',`);
+    flutterLines.push(`    fontWeight: FontWeight.w${token.weight},`);
+    if (token.fontStyle === 'italic' || token.fontStyle === 'oblique') {
+      flutterLines.push('    fontStyle: FontStyle.italic,');
+    }
+    if (token.fontSize !== null) flutterLines.push(`    fontSize: ${token.fontSize},`);
+    if (token.lineHeight && token.lineHeight.endsWith('px') && token.fontSize) {
+      flutterLines.push(`    height: ${round(parseFloat(token.lineHeight) / token.fontSize)},`);
+    } else if (token.lineHeight && token.lineHeight.endsWith('%')) {
+      flutterLines.push(`    height: ${round(parseFloat(token.lineHeight) / 100)},`);
+    }
+    if (token.letterSpacing && token.letterSpacing.endsWith('px')) {
+      flutterLines.push(`    letterSpacing: ${parseFloat(token.letterSpacing)},`);
+    }
+    const color = dartColor(token.color);
+    if (color) flutterLines.push(`    color: ${color},`);
+    flutterLines.push('  );');
+  });
+  flutterLines.push('}', '', '/*', 'pubspec.yaml', 'flutter:', '  fonts:');
+  designSystem.fonts.forEach((font) => {
+    flutterLines.push(`    - family: ${font.family}`, '      fonts:');
+    font.styles.forEach((style) => {
+      flutterLines.push(
+        `        - asset: assets/fonts/${slugToken(font.family)}-${slugToken(style.figmaStyle)}.ttf`,
+        `          weight: ${style.weight}`
+      );
+      if (style.fontStyle === 'italic' || style.fontStyle === 'oblique') flutterLines.push('          style: italic');
+    });
+  });
+  flutterLines.push('*/');
+
+  return {
+    css: cssLines.join('\n'),
+    flutter: flutterLines.join('\n'),
+    json: JSON.stringify(
+      {
+        name: designSystem.name,
+        fonts: designSystem.fonts,
+        typography: designSystem.typography,
+        colors: designSystem.colors,
+        gradients: designSystem.gradients,
+        radii: designSystem.radii,
+        shadows: designSystem.shadows,
+        spacing: designSystem.spacing,
+        components: designSystem.components,
+      },
+      null,
+      2
+    ),
+  };
+}
+
+async function buildDesignSystem(node) {
+  const source = { textRuns: [], colors: [], gradients: [], radii: [], shadows: [], spacing: [] };
+  collectDesignSource(node, source);
+  const available = await getAvailableFontSet();
+
+  const typography = uniquifyTokenNames(aggregateTokens(
+    source.textRuns,
+    (item) =>
+      [
+        item.family,
+        item.figmaStyle,
+        item.fontSize,
+        item.lineHeight,
+        item.letterSpacing,
+        item.color,
+      ].join('|'),
+    (item) =>
+      `type-${slugToken(item.family)}-${item.fontSize === null ? 'mixed' : item.fontSize}-${item.weight}${
+        item.fontStyle === 'normal' ? '' : `-${item.fontStyle}`
+      }`
+  ));
+  const fontMap = new Map();
+  source.textRuns.forEach((run) => {
+    let font = fontMap.get(run.family);
+    if (!font) {
+      font = { family: run.family, usageCount: 0, available: false, styles: [] };
+      fontMap.set(run.family, font);
+    }
+    font.usageCount += 1;
+    let style = font.styles.find((item) => item.figmaStyle === run.figmaStyle);
+    if (!style) {
+      style = {
+        figmaStyle: run.figmaStyle,
+        weight: run.weight,
+        fontStyle: run.fontStyle,
+        usageCount: 0,
+        available: available ? available.has(`${run.family}\u0000${run.figmaStyle}`) : null,
+      };
+      font.styles.push(style);
+    }
+    style.usageCount += 1;
+  });
+  const fonts = Array.from(fontMap.values()).map((font) => {
+    font.available = font.styles.every((style) => style.available === true)
+      ? true
+      : font.styles.some((style) => style.available === false)
+        ? false
+        : null;
+    return font;
+  });
+
+  const colors = aggregateTokens(
+    source.colors,
+    (item) => item.value,
+    (item) => `color-${slugToken(item.value.replace('#', ''))}`
+  );
+  const gradients = aggregateTokens(
+    source.gradients,
+    (item) => item.value,
+    (_item) => `gradient-${String(source.gradients.indexOf(_item) + 1).padStart(2, '0')}`
+  );
+  const radii = aggregateTokens(
+    source.radii,
+    (item) => item.value,
+    (item) => `radius-${slugToken(item.value)}`
+  );
+  const shadows = aggregateTokens(
+    source.shadows,
+    (item) => item.value,
+    (_item) => `shadow-${String(source.shadows.indexOf(_item) + 1).padStart(2, '0')}`
+  );
+  const spacing = aggregateTokens(
+    source.spacing,
+    (item) => String(item.value),
+    (item) => `space-${slugToken(item.value)}`
+  ).sort((a, b) => a.value - b.value);
+
+  const componentMap = new Map();
+  function addUsage(token, kind) {
+    token.nodes.forEach((usedNode) => {
+      let component = componentMap.get(usedNode.id);
+      if (!component) {
+        component = {
+          nodeId: usedNode.id,
+          nodeName: usedNode.name,
+          typography: [],
+          colors: [],
+          gradients: [],
+          radii: [],
+          shadows: [],
+          spacing: [],
+        };
+        componentMap.set(usedNode.id, component);
+      }
+      if (component[kind].indexOf(token.token) === -1) component[kind].push(token.token);
+    });
+  }
+  typography.forEach((token) => addUsage(token, 'typography'));
+  colors.forEach((token) => addUsage(token, 'colors'));
+  gradients.forEach((token) => addUsage(token, 'gradients'));
+  radii.forEach((token) => addUsage(token, 'radii'));
+  shadows.forEach((token) => addUsage(token, 'shadows'));
+  spacing.forEach((token) => addUsage(token, 'spacing'));
+
+  const designSystem = {
+    name: node.name,
+    fonts,
+    typography,
+    colors,
+    gradients,
+    radii,
+    shadows,
+    spacing,
+    components: Array.from(componentMap.values()),
+  };
+  designSystem.exports = buildDesignSystemExports(designSystem);
+  return designSystem;
+}
+
 // ---------- CSS extraction ----------
 
 function averageGradientColor(fill) {
@@ -1420,6 +1837,7 @@ async function generateHtml(node) {
 
 function buildCompactNode(node) {
   const compact = {
+    id: node.id,
     type: node.type,
     name: node.name,
     width: round(node.width),
@@ -1668,13 +2086,22 @@ async function buildPayload(node) {
   const dart = await generateDart(node);
   const htmlResult = await generateHtml(node);
   const compact = buildCompactNode(node);
+  const designSystem = await buildDesignSystem(node);
   const preview = await exportPreviewPng(node);
   const raw = buildRawNode(node);
 
   // Caveats from anywhere in the subtree matter just as much as ones on the
   // selected node itself — a flattened child is exactly what makes a preview
   // stop matching the design.
-  const allWarnings = warnings.concat(htmlResult.warnings).filter((w, i, a) => a.indexOf(w) === i);
+  const fontWarnings = designSystem.fonts
+    .filter((font) => font.available === false)
+    .map(
+      (font) =>
+        `"${font.family}": one or more font styles are unavailable in Figma; HTML/Flutter will fall back until the font files are installed`
+    );
+  const allWarnings = warnings
+    .concat(htmlResult.warnings, fontWarnings)
+    .filter((w, i, a) => a.indexOf(w) === i);
 
   return {
     type: 'selection',
@@ -1686,6 +2113,7 @@ async function buildPayload(node) {
     dart,
     html: htmlResult.html,
     compact,
+    designSystem,
     previewImage: preview ? preview.uri : null,
     previewCrop: preview ? preview.crop : null,
     raw,

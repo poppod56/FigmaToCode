@@ -13,9 +13,11 @@
   .tabs {
     display: flex;
     border-bottom: 1px solid #e6e6e6;
+    overflow-x: auto;
   }
   .tab {
     flex: 1;
+    min-width: 66px;
     padding: 10px 0;
     text-align: center;
     cursor: pointer;
@@ -142,6 +144,68 @@
     transform-origin: top left;
     display: block;
   }
+  .system-summary {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    margin-bottom: 10px;
+  }
+  .system-stat, .system-card {
+    border: 1px solid #e6e6e6;
+    border-radius: 6px;
+    padding: 8px;
+  }
+  .system-stat strong {
+    display: block;
+    font-size: 17px;
+    line-height: 20px;
+  }
+  .system-title {
+    font-weight: 600;
+    margin: 10px 0 6px;
+  }
+  .font-list, .component-list {
+    display: grid;
+    gap: 6px;
+    max-height: 160px;
+    overflow-y: auto;
+  }
+  .system-card-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .system-card-name { font-weight: 600; }
+  .system-card-meta {
+    color: #8c8c8c;
+    font-size: 10px;
+    margin-top: 3px;
+    word-break: break-word;
+  }
+  .font-status {
+    flex-shrink: 0;
+    border-radius: 999px;
+    padding: 2px 6px;
+    font-size: 9px;
+  }
+  .font-status.available { background: #dcfce7; color: #166534; }
+  .font-status.missing { background: #fee2e2; color: #991b1b; }
+  .font-status.unknown { background: #f3f4f6; color: #6b7280; }
+  .design-export-row {
+    display: flex;
+    gap: 6px;
+    margin: 10px 0 6px;
+  }
+  .design-export-row select {
+    flex: 1;
+    padding: 6px 8px;
+    border: 1px solid #e6e6e6;
+    border-radius: 6px;
+    background: #fff;
+    color: inherit;
+    font-size: 11px;
+  }
   @media (prefers-color-scheme: dark) {
     body { background: #2c2c2c; color: #eaeaea; }
     .tabs { border-bottom-color: #444; }
@@ -155,6 +219,11 @@
     .preview-figma-img { border-color: #444; }
     .preview-iframe-wrap { border-color: #444; }
     .debug-send-row { border-bottom-color: #444; }
+    .system-stat, .system-card, .design-export-row select { border-color: #444; }
+    .design-export-row select { background: #1e1e1e; }
+    .font-status.available { background: #173b24; color: #86efac; }
+    .font-status.missing { background: #451a1a; color: #fca5a5; }
+    .font-status.unknown { background: #374151; color: #d1d5db; }
   }
 </style>
 
@@ -163,6 +232,7 @@
   <button class="tab" data-tab="flutter">Flutter</button>
   <button class="tab" data-tab="html">HTML</button>
   <button class="tab" data-tab="ai">AI-enhanced</button>
+  <button class="tab" data-tab="design">Design System</button>
   <button class="tab" data-tab="preview">Preview</button>
 </div>
 
@@ -227,6 +297,28 @@
     <div id="ai-error"></div>
     <pre class="code-block" id="ai-output" style="margin-top:8px;"></pre>
     <button class="copy-btn" id="ai-copy-btn" data-copy="ai-output" disabled>Copy code</button>
+  </div>
+
+  <div class="panel" id="panel-design">
+    <div class="node-name" id="design-node-name"></div>
+    <div class="hint">Tokens and component usage found in the selected subtree. Font availability is checked against Figma.</div>
+    <div id="design-summary" class="system-summary"></div>
+
+    <div class="system-title">Fonts</div>
+    <div id="design-fonts" class="font-list"></div>
+
+    <div class="system-title">Component mapping</div>
+    <div id="design-components" class="component-list"></div>
+
+    <div class="design-export-row">
+      <select id="design-export-format">
+        <option value="css">CSS tokens + @font-face</option>
+        <option value="flutter">Flutter theme + pubspec</option>
+        <option value="json">Design Tokens JSON / AI</option>
+      </select>
+      <button class="copy-btn" data-copy="design-output">Copy</button>
+    </div>
+    <pre class="code-block" id="design-output"></pre>
   </div>
 
   <div class="panel" id="panel-preview">
@@ -324,8 +416,10 @@
     document.getElementById('flutter-node-name').textContent = payload.nodeName;
     document.getElementById('html-node-name').textContent = payload.nodeName;
     document.getElementById('ai-node-name').textContent = payload.nodeName;
+    document.getElementById('design-node-name').textContent = payload.nodeName;
     document.getElementById('preview-node-name').textContent = payload.nodeName;
 
+    renderDesignSystem(payload.designSystem);
     renderPreview(payload);
 
     const warningsEl = document.getElementById('css-warnings');
@@ -346,6 +440,97 @@
     document.getElementById('ai-copy-btn').disabled = true;
     document.getElementById('ai-error').innerHTML = '';
   }
+
+  function renderDesignSystem(system) {
+    const summary = document.getElementById('design-summary');
+    const fontsEl = document.getElementById('design-fonts');
+    const componentsEl = document.getElementById('design-components');
+    summary.innerHTML = '';
+    fontsEl.innerHTML = '';
+    componentsEl.innerHTML = '';
+
+    [
+      ['Fonts', (system && system.fonts.length) || 0],
+      ['Type styles', (system && system.typography.length) || 0],
+      ['Colors', (system && system.colors.length) || 0],
+    ].forEach(([label, value]) => {
+      const card = document.createElement('div');
+      card.className = 'system-stat';
+      const strong = document.createElement('strong');
+      strong.textContent = value;
+      const text = document.createElement('span');
+      text.textContent = label;
+      card.appendChild(strong);
+      card.appendChild(text);
+      summary.appendChild(card);
+    });
+
+    if (!system || system.fonts.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'system-card-meta';
+      empty.textContent = 'No text fonts found in this selection.';
+      fontsEl.appendChild(empty);
+    } else {
+      system.fonts.forEach((font) => {
+        const card = document.createElement('div');
+        card.className = 'system-card';
+        const row = document.createElement('div');
+        row.className = 'system-card-row';
+        const content = document.createElement('div');
+        const name = document.createElement('div');
+        name.className = 'system-card-name';
+        name.textContent = font.family;
+        const meta = document.createElement('div');
+        meta.className = 'system-card-meta';
+        meta.textContent = font.styles
+          .map((style) => `${style.figmaStyle} · ${style.weight}${style.fontStyle !== 'normal' ? ' · italic' : ''}`)
+          .join(', ');
+        content.appendChild(name);
+        content.appendChild(meta);
+
+        const status = document.createElement('span');
+        status.className =
+          'font-status ' + (font.available === true ? 'available' : font.available === false ? 'missing' : 'unknown');
+        status.textContent = font.available === true ? 'Available' : font.available === false ? 'Missing' : 'Unknown';
+        row.appendChild(content);
+        row.appendChild(status);
+        card.appendChild(row);
+        fontsEl.appendChild(card);
+      });
+    }
+
+    const mapped = (system && system.components) || [];
+    if (mapped.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'system-card-meta';
+      empty.textContent = 'No component token usage found.';
+      componentsEl.appendChild(empty);
+    } else {
+      mapped.forEach((component) => {
+        const card = document.createElement('div');
+        card.className = 'system-card';
+        const name = document.createElement('div');
+        name.className = 'system-card-name';
+        name.textContent = component.nodeName;
+        const meta = document.createElement('div');
+        meta.className = 'system-card-meta';
+        const tokens = component.typography.concat(component.colors);
+        meta.textContent = tokens.length ? tokens.join(' · ') : 'No mapped tokens';
+        card.appendChild(name);
+        card.appendChild(meta);
+        componentsEl.appendChild(card);
+      });
+    }
+    updateDesignExport();
+  }
+
+  function updateDesignExport() {
+    const format = document.getElementById('design-export-format').value;
+    const exports = currentPayload && currentPayload.designSystem && currentPayload.designSystem.exports;
+    document.getElementById('design-output').textContent = (exports && exports[format]) || '';
+  }
+
+  document.getElementById('design-export-format').addEventListener('change', updateDesignExport);
 
   function renderPreview(payload) {
     const img = document.getElementById('preview-figma-img');
@@ -498,7 +683,9 @@
       'over a data list instead of repeating widget code. (3) Wrap nodes in Container with width/height/decoration ' +
       'matching the JSON. (4) Use Row/Column for "layout": "row"/"column". For a node whose children have "x"/"y" ' +
       'instead, use Stack with each child wrapped in Positioned(left: x, top: y, child: ...). ' +
-      '(5) Respond with ONLY the Dart code, no explanation, no markdown fences.',
+      '(5) Use the supplied designSystem typography/component token mapping for exact font family, weight, size, ' +
+      'line height, letter spacing, and colors. Never substitute or guess a font family. ' +
+      '(6) Respond with ONLY the Dart code, no explanation, no markdown fences.',
     html:
       'You are a front-end code generator. Convert the given Figma node JSON tree into semantic HTML with a matching ' +
       'CSS stylesheet. ' +
@@ -508,7 +695,8 @@
       'children that repeat the same structure/pattern, generate one reusable markup block instead of repeating it verbatim. ' +
       '(3) Use flexbox for "layout": "row"/"column" nodes, matching gap and padding. For a node whose children have ' +
       '"x"/"y" instead, give that node position: relative and each such child position: absolute; left: x; top: y. ' +
-      '(4) Respond with ONLY the HTML and a <style> block, no explanation, no markdown fences.',
+      '(4) Use the supplied designSystem tokens and component mapping. Never guess or substitute a font family. ' +
+      '(5) Respond with ONLY the HTML and a <style> block, no explanation, no markdown fences.',
     css:
       'You are a CSS generator. Convert the given Figma node JSON tree into a CSS stylesheet only (no HTML markup). ' +
       RECURSION_RULE +
@@ -516,7 +704,8 @@
       'Rules: (1) Name each rule after the node\'s "name" field (kebab-case class). (2) Use flexbox for "layout": ' +
       '"row"/"column" nodes, matching gap and padding. For a node whose children have "x"/"y" instead, give that node ' +
       'position: relative and each such child position: absolute; left: x; top: y. ' +
-      '(3) Respond with ONLY CSS, no explanation, no markdown fences.',
+      '(3) Use the supplied designSystem tokens and component mapping. Never guess or substitute a font family. ' +
+      '(4) Respond with ONLY CSS, no explanation, no markdown fences.',
   };
 
   const PRESET_BASE_URLS = {
@@ -601,7 +790,13 @@
           model,
           messages: [
             { role: 'system', content: SYSTEM_PROMPTS[format] },
-            { role: 'user', content: JSON.stringify(currentPayload.compact) },
+            {
+              role: 'user',
+              content: JSON.stringify({
+                node: currentPayload.compact,
+                designSystem: currentPayload.designSystem,
+              }),
+            },
           ],
           temperature: 0.2,
           max_tokens: 8192,
