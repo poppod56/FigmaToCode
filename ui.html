@@ -1,0 +1,646 @@
+<style>
+  :root {
+    color-scheme: light dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: Inter, "SF Pro Text", -apple-system, sans-serif;
+    font-size: 12px;
+    color: #1e1e1e;
+    background: #fff;
+  }
+  .tabs {
+    display: flex;
+    border-bottom: 1px solid #e6e6e6;
+  }
+  .tab {
+    flex: 1;
+    padding: 10px 0;
+    text-align: center;
+    cursor: pointer;
+    background: none;
+    border: none;
+    font-size: 12px;
+    font-weight: 500;
+    color: #6b6b6b;
+    border-bottom: 2px solid transparent;
+  }
+  .tab.active {
+    color: #18a0fb;
+    border-bottom-color: #18a0fb;
+  }
+  .panel { display: none; padding: 12px; }
+  .panel.active { display: block; }
+  .node-name {
+    font-weight: 600;
+    margin-bottom: 8px;
+    word-break: break-all;
+  }
+  .warning {
+    background: #fff4e5;
+    color: #92610a;
+    border: 1px solid #ffdca0;
+    border-radius: 4px;
+    padding: 6px 8px;
+    margin-bottom: 8px;
+    font-size: 11px;
+  }
+  pre.code-block {
+    background: #f5f5f5;
+    border: 1px solid #e6e6e6;
+    border-radius: 6px;
+    padding: 10px;
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 380px;
+    overflow-y: auto;
+    margin: 0 0 8px 0;
+  }
+  .copy-btn, .primary-btn {
+    background: #18a0fb;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .copy-btn:hover, .primary-btn:hover { background: #0d8ce0; }
+  .copy-btn:disabled, .primary-btn:disabled { background: #b8e0fd; cursor: default; }
+  .empty-state {
+    padding: 40px 16px;
+    text-align: center;
+    color: #8c8c8c;
+  }
+  .endpoint-row {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+  .endpoint-row input,
+  .endpoint-row select {
+    flex: 1;
+    padding: 6px 8px;
+    border: 1px solid #e6e6e6;
+    border-radius: 6px;
+    font-size: 11px;
+    background: #fff;
+    color: inherit;
+  }
+  .ai-error {
+    background: #ffe8e6;
+    color: #b3261e;
+    border: 1px solid #ffb4ac;
+    border-radius: 4px;
+    padding: 6px 8px;
+    margin-bottom: 8px;
+    font-size: 11px;
+  }
+  .hint {
+    color: #8c8c8c;
+    font-size: 10px;
+    margin: -4px 0 8px 0;
+  }
+  .status-ok { color: #1a7f37; }
+  .status-error { color: #b3261e; }
+  .debug-send-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    border-bottom: 1px solid #e6e6e6;
+  }
+  .preview-label {
+    font-weight: 600;
+    font-size: 11px;
+    margin: 8px 0 4px 0;
+  }
+  /* Window that crops the Figma export down to the node's own box — the export
+     itself also covers any shadow/stroke that overhangs it. */
+  .preview-figma-wrap {
+    overflow: hidden;
+    border: 1px solid #e6e6e6;
+    border-radius: 6px;
+    background: repeating-conic-gradient(#e6e6e6 0% 25%, #fff 0% 50%) 50% / 16px 16px;
+  }
+  .preview-figma-img {
+    display: block;
+    transform-origin: top left;
+  }
+  .preview-iframe-wrap {
+    overflow: hidden;
+    border: 1px solid #e6e6e6;
+    border-radius: 6px;
+    /* Same checkerboard as the Figma image above, so a node with transparency
+       is compared against an identical backdrop instead of plain white. */
+    background: repeating-conic-gradient(#e6e6e6 0% 25%, #fff 0% 50%) 50% / 16px 16px;
+  }
+  .preview-render-host {
+    transform-origin: top left;
+    display: block;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #2c2c2c; color: #eaeaea; }
+    .tabs { border-bottom-color: #444; }
+    .tab { color: #9a9a9a; }
+    pre.code-block { background: #1e1e1e; border-color: #444; color: #eaeaea; }
+    .endpoint-row input, .endpoint-row select { background: #1e1e1e; border-color: #444; color: #eaeaea; }
+    .warning { background: #3a2e12; color: #f0c060; border-color: #5a4720; }
+    .ai-error { background: #3a1a17; color: #ff8f85; border-color: #5a2a24; }
+    .status-ok { color: #4ade80; }
+    .status-error { color: #ff8f85; }
+    .preview-figma-img { border-color: #444; }
+    .preview-iframe-wrap { border-color: #444; }
+    .debug-send-row { border-bottom-color: #444; }
+  }
+</style>
+
+<div class="tabs">
+  <button class="tab active" data-tab="css">CSS</button>
+  <button class="tab" data-tab="flutter">Flutter</button>
+  <button class="tab" data-tab="html">HTML</button>
+  <button class="tab" data-tab="ai">AI-enhanced</button>
+  <button class="tab" data-tab="preview">Preview</button>
+</div>
+
+<div id="debug-send-row" class="debug-send-row" style="display:none;">
+  <button class="copy-btn" id="debug-connect-btn">Connect</button>
+  <span id="debug-send-status" class="hint" style="margin:0;">Not connected — every selection stays local until you connect.</span>
+</div>
+
+<div id="empty-state" class="empty-state">Select an element on the canvas to inspect it.</div>
+
+<div id="panels" style="display:none">
+  <div class="panel active" id="panel-css">
+    <div class="node-name" id="css-node-name"></div>
+    <div id="css-warnings"></div>
+    <pre class="code-block" id="css-output"></pre>
+    <button class="copy-btn" data-copy="css-output">Copy CSS</button>
+  </div>
+
+  <div class="panel" id="panel-flutter">
+    <div class="node-name" id="flutter-node-name"></div>
+    <pre class="code-block" id="flutter-output"></pre>
+    <button class="copy-btn" data-copy="flutter-output">Copy Dart</button>
+  </div>
+
+  <div class="panel" id="panel-html">
+    <div class="node-name" id="html-node-name"></div>
+    <div class="hint">Full node tree, recursively — one &lt;div&gt;/&lt;p&gt; per node plus a matching &lt;style&gt; block.</div>
+    <pre class="code-block" id="html-output"></pre>
+    <button class="copy-btn" data-copy="html-output">Copy HTML</button>
+  </div>
+
+  <div class="panel" id="panel-ai">
+    <div class="node-name" id="ai-node-name"></div>
+
+    <div class="endpoint-row">
+      <select id="ai-preset">
+        <option value="lmstudio">LM Studio</option>
+        <option value="ollama">Ollama</option>
+        <option value="custom">Custom</option>
+      </select>
+    </div>
+    <div class="endpoint-row">
+      <input id="ai-base-url" type="text" value="http://localhost:1234/v1" />
+      <button class="copy-btn" id="ai-test-btn" style="flex-shrink:0;">Test connection</button>
+    </div>
+    <div id="ai-status" class="hint">Not connected yet — pick a preset (or enter any OpenAI-compatible base URL) and test.</div>
+
+    <div class="endpoint-row">
+      <select id="ai-model" disabled>
+        <option value="">Test connection to load models</option>
+      </select>
+    </div>
+
+    <div class="endpoint-row">
+      <select id="ai-format">
+        <option value="flutter">Flutter / Dart</option>
+        <option value="html">HTML + CSS</option>
+        <option value="css">CSS only</option>
+      </select>
+    </div>
+    <button class="primary-btn" id="ai-generate-btn">Generate with local AI</button>
+    <div id="ai-error"></div>
+    <pre class="code-block" id="ai-output" style="margin-top:8px;"></pre>
+    <button class="copy-btn" id="ai-copy-btn" data-copy="ai-output" disabled>Copy code</button>
+  </div>
+
+  <div class="panel" id="panel-preview">
+    <div class="node-name" id="preview-node-name"></div>
+    <div class="hint">Real Figma render (ground truth) vs. the generated HTML rendered live — for spotting layout drift without leaving the plugin.</div>
+
+    <div class="preview-label">Figma</div>
+    <div id="preview-figma-wrap" class="preview-figma-wrap">
+      <img id="preview-figma-img" class="preview-figma-img" />
+    </div>
+    <div id="preview-figma-missing" class="hint" style="display:none;">Preview export failed for this selection.</div>
+
+    <div class="preview-label">Generated HTML (live)</div>
+    <div id="preview-iframe-wrap" class="preview-iframe-wrap">
+      <div id="preview-render-host" class="preview-render-host"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  let currentPayload = null;
+
+  document.querySelectorAll('.tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
+      document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
+      tab.classList.add('active');
+      document.getElementById('panel-' + tab.dataset.tab).classList.add('active');
+    });
+  });
+
+  function copyText(text) {
+    // Figma's plugin UI iframe doesn't grant the clipboard-write permission
+    // navigator.clipboard needs, so it silently rejects there. execCommand
+    // still works inside that sandbox, so try clipboard API first and fall
+    // back to it rather than failing silently.
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).catch(() => copyViaExecCommand(text));
+    }
+    return copyViaExecCommand(text);
+  }
+
+  function copyViaExecCommand(text) {
+    return new Promise((resolve, reject) => {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.left = '-9999px';
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      let ok = false;
+      try {
+        ok = document.execCommand('copy');
+      } catch (e) {
+        ok = false;
+      }
+      document.body.removeChild(textarea);
+      ok ? resolve() : reject(new Error('execCommand copy failed'));
+    });
+  }
+
+  document.querySelectorAll('.copy-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const target = document.getElementById(btn.dataset.copy);
+      const text = target.textContent;
+      copyText(text)
+        .then(() => {
+          const original = btn.textContent;
+          btn.textContent = 'Copied!';
+          setTimeout(() => (btn.textContent = original), 1200);
+        })
+        .catch(() => {
+          const original = btn.textContent;
+          btn.textContent = 'Copy failed';
+          setTimeout(() => (btn.textContent = original), 1200);
+        });
+    });
+  });
+
+  function formatCss(css) {
+    return Object.keys(css)
+      .map((key) => `  ${key}: ${css[key]};`)
+      .join('\n');
+  }
+
+  function render(payload) {
+    currentPayload = payload;
+    document.getElementById('empty-state').style.display = 'none';
+    document.getElementById('panels').style.display = 'block';
+    document.getElementById('debug-send-row').style.display = 'flex';
+    if (debugConnected) sendDebugPayload(payload);
+
+    document.getElementById('css-node-name').textContent = payload.nodeName;
+    document.getElementById('flutter-node-name').textContent = payload.nodeName;
+    document.getElementById('html-node-name').textContent = payload.nodeName;
+    document.getElementById('ai-node-name').textContent = payload.nodeName;
+    document.getElementById('preview-node-name').textContent = payload.nodeName;
+
+    renderPreview(payload);
+
+    const warningsEl = document.getElementById('css-warnings');
+    warningsEl.innerHTML = '';
+    (payload.warnings || []).forEach((w) => {
+      const div = document.createElement('div');
+      div.className = 'warning';
+      div.textContent = w;
+      warningsEl.appendChild(div);
+    });
+
+    document.getElementById('css-output').textContent = '.' + safeSelector(payload.nodeName) + ' {\n' + formatCss(payload.css) + '\n}';
+    document.getElementById('flutter-output').textContent = payload.dart;
+    document.getElementById('html-output').textContent = payload.html;
+
+    // reset AI tab per new selection
+    document.getElementById('ai-output').textContent = '';
+    document.getElementById('ai-copy-btn').disabled = true;
+    document.getElementById('ai-error').innerHTML = '';
+  }
+
+  function renderPreview(payload) {
+    const img = document.getElementById('preview-figma-img');
+    const figmaWrap = document.getElementById('preview-figma-wrap');
+    const missingMsg = document.getElementById('preview-figma-missing');
+    if (payload.previewImage) {
+      img.src = payload.previewImage;
+      img.style.display = 'block';
+      figmaWrap.style.display = 'block';
+      missingMsg.style.display = 'none';
+    } else {
+      img.removeAttribute('src');
+      figmaWrap.style.display = 'none';
+      missingMsg.style.display = 'block';
+    }
+
+    // Figma's plugin UI iframe blocks nested iframes via CSP (frame-src), so
+    // a <iframe srcdoc> here just renders blank with no visible error. Shadow
+    // DOM sidesteps that entirely — it's plain DOM in the same document, just
+    // style-encapsulated so the generated CSS's generic class names (.text,
+    // .icon, ...) can't clash with this page's own styles in either direction.
+    const host = document.getElementById('preview-render-host');
+    const wrap = document.getElementById('preview-iframe-wrap');
+    const nodeWidth = payload.width || 1;
+    const nodeHeight = payload.height || 1;
+
+    if (!host.shadowRoot) host.attachShadow({ mode: 'open' });
+    host.shadowRoot.innerHTML = payload.html;
+    host.style.width = `${nodeWidth}px`;
+    host.style.height = `${nodeHeight}px`;
+
+    // Scale both panes by the same factor to fit the panel width, once it's
+    // actually laid out (immediately after unhiding the panel, clientWidth is
+    // still 0).
+    requestAnimationFrame(() => {
+      const containerWidth = wrap.parentElement.clientWidth || nodeWidth;
+      const scale = Math.min(1, containerWidth / nodeWidth);
+
+      host.style.transform = `scale(${scale})`;
+      wrap.style.width = `${nodeWidth * scale}px`;
+      wrap.style.height = `${nodeHeight * scale}px`;
+
+      // Crop the export back to the node box and match the same scale, so the
+      // two panes show the identical region at the identical size.
+      const crop = payload.previewCrop;
+      if (payload.previewImage && crop) {
+        const px = scale / crop.scale;
+        img.style.width = `${crop.imageWidth * px}px`;
+        img.style.height = `${crop.imageHeight * px}px`;
+        img.style.marginLeft = `${-crop.offsetX * px}px`;
+        img.style.marginTop = `${-crop.offsetY * px}px`;
+        figmaWrap.style.width = `${nodeWidth * scale}px`;
+        figmaWrap.style.height = `${nodeHeight * scale}px`;
+      } else if (payload.previewImage) {
+        // No crop info (older payload / node without bounds) — show it whole.
+        img.style.width = `${nodeWidth * scale}px`;
+        img.style.height = 'auto';
+        img.style.marginLeft = '0';
+        img.style.marginTop = '0';
+        figmaWrap.style.width = `${nodeWidth * scale}px`;
+        figmaWrap.style.height = 'auto';
+      }
+    });
+  }
+
+  function safeSelector(name) {
+    let base = (name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+    if (!base) base = 'element';
+    if (/^[0-9]/.test(base)) base = `n-${base}`;
+    return base;
+  }
+
+  function showEmpty() {
+    currentPayload = null;
+    document.getElementById('empty-state').style.display = 'block';
+    document.getElementById('panels').style.display = 'none';
+    document.getElementById('debug-send-row').style.display = 'none';
+  }
+
+  // Once connected, every new selection (render() call) gets pushed to the
+  // local debug server automatically — no per-selection click needed.
+  let debugConnected = false;
+
+  async function sendDebugPayload(payload) {
+    const status = document.getElementById('debug-send-status');
+    status.className = 'hint';
+    status.textContent = 'Sending...';
+    try {
+      const res = await fetch('http://localhost:8787/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      status.className = 'hint status-ok';
+      status.textContent = `Connected — sent "${payload.nodeName}" ✓`;
+    } catch (err) {
+      status.className = 'hint status-error';
+      status.textContent = 'Send failed — is the debug server running? ' + (err && err.message ? err.message : err);
+    }
+  }
+
+  document.getElementById('debug-connect-btn').addEventListener('click', () => {
+    const btn = document.getElementById('debug-connect-btn');
+    const status = document.getElementById('debug-send-status');
+    debugConnected = !debugConnected;
+    btn.textContent = debugConnected ? 'Disconnect' : 'Connect';
+    if (debugConnected) {
+      status.className = 'hint status-ok';
+      status.textContent = 'Connected — selections will auto-send.';
+      if (currentPayload) sendDebugPayload(currentPayload);
+    } else {
+      status.className = 'hint';
+      status.textContent = 'Not connected — every selection stays local until you connect.';
+    }
+  });
+
+  window.onmessage = (event) => {
+    const msg = event.data.pluginMessage;
+    if (!msg) return;
+    if (msg.type === 'empty') {
+      showEmpty();
+    } else if (msg.type === 'selection') {
+      render(msg);
+    } else if (msg.type === 'error') {
+      showEmpty();
+    }
+  };
+
+  const RECURSION_RULE =
+    'CRITICAL: The JSON tree may be deeply nested with many children at every level. You MUST walk the entire tree and ' +
+    'emit code for every single node, at every depth, with no exceptions. Never summarize, truncate, skip, or merge ' +
+    'nodes for brevity unless rule (2) below explicitly applies (exact repeated pattern → loop/builder). If you are ' +
+    'unsure whether two nodes are "the same repeated pattern", treat them as different and emit both in full. ';
+
+  const POSITION_RULE =
+    'CRITICAL: A child object that has "x" and "y" fields belongs to a parent with NO "layout" field — that parent ' +
+    'does NOT flow its children in a row/column, it places them freely at those exact pixel offsets from its own ' +
+    'top-left corner, and they may overlap. You MUST position such a child at that exact offset (absolute/free ' +
+    'positioning) — never just stack it under the previous sibling in normal document flow. A child with no ' +
+    '"x"/"y" fields belongs to a "layout": "row"/"column" parent and should flow normally via that layout instead. ';
+
+  const SYSTEM_PROMPTS = {
+    flutter:
+      'You are a Flutter code generator. Convert the given Figma node JSON tree into idiomatic Dart widget code. ' +
+      RECURSION_RULE +
+      POSITION_RULE +
+      'Rules: (1) Name widgets and local variables after each node\'s "name" field (converted to lowerCamelCase). ' +
+      '(2) If a frame has multiple children that repeat the same structure/pattern, generate a single ListView.builder ' +
+      'over a data list instead of repeating widget code. (3) Wrap nodes in Container with width/height/decoration ' +
+      'matching the JSON. (4) Use Row/Column for "layout": "row"/"column". For a node whose children have "x"/"y" ' +
+      'instead, use Stack with each child wrapped in Positioned(left: x, top: y, child: ...). ' +
+      '(5) Respond with ONLY the Dart code, no explanation, no markdown fences.',
+    html:
+      'You are a front-end code generator. Convert the given Figma node JSON tree into semantic HTML with a matching ' +
+      'CSS stylesheet. ' +
+      RECURSION_RULE +
+      POSITION_RULE +
+      'Rules: (1) Name classes after each node\'s "name" field (kebab-case). (2) If a frame has multiple ' +
+      'children that repeat the same structure/pattern, generate one reusable markup block instead of repeating it verbatim. ' +
+      '(3) Use flexbox for "layout": "row"/"column" nodes, matching gap and padding. For a node whose children have ' +
+      '"x"/"y" instead, give that node position: relative and each such child position: absolute; left: x; top: y. ' +
+      '(4) Respond with ONLY the HTML and a <style> block, no explanation, no markdown fences.',
+    css:
+      'You are a CSS generator. Convert the given Figma node JSON tree into a CSS stylesheet only (no HTML markup). ' +
+      RECURSION_RULE +
+      POSITION_RULE +
+      'Rules: (1) Name each rule after the node\'s "name" field (kebab-case class). (2) Use flexbox for "layout": ' +
+      '"row"/"column" nodes, matching gap and padding. For a node whose children have "x"/"y" instead, give that node ' +
+      'position: relative and each such child position: absolute; left: x; top: y. ' +
+      '(3) Respond with ONLY CSS, no explanation, no markdown fences.',
+  };
+
+  const PRESET_BASE_URLS = {
+    lmstudio: 'http://localhost:1234/v1',
+    ollama: 'http://localhost:11434/v1',
+    custom: '',
+  };
+
+  function getBaseUrl() {
+    return document.getElementById('ai-base-url').value.trim().replace(/\/+$/, '');
+  }
+
+  document.getElementById('ai-preset').addEventListener('change', (e) => {
+    const preset = e.target.value;
+    if (preset !== 'custom') {
+      document.getElementById('ai-base-url').value = PRESET_BASE_URLS[preset];
+    }
+  });
+
+  document.getElementById('ai-test-btn').addEventListener('click', async () => {
+    const baseUrl = getBaseUrl();
+    const statusEl = document.getElementById('ai-status');
+    const modelSelect = document.getElementById('ai-model');
+    const testBtn = document.getElementById('ai-test-btn');
+
+    statusEl.className = 'hint';
+    statusEl.textContent = 'Connecting...';
+    testBtn.disabled = true;
+
+    try {
+      const res = await fetch(`${baseUrl}/models`);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      const models = ((data && data.data) || []).map((m) => m.id).filter(Boolean);
+      if (models.length === 0) throw new Error('server returned no models');
+
+      modelSelect.innerHTML = '';
+      models.forEach((id) => {
+        const opt = document.createElement('option');
+        opt.value = id;
+        opt.textContent = id;
+        modelSelect.appendChild(opt);
+      });
+      modelSelect.disabled = false;
+
+      statusEl.className = 'hint status-ok';
+      statusEl.textContent = `เชื่อมต่อสำเร็จ — พบ ${models.length} model`;
+    } catch (err) {
+      modelSelect.innerHTML = '<option value="">Test connection to load models</option>';
+      modelSelect.disabled = true;
+
+      statusEl.className = 'hint status-error';
+      statusEl.textContent =
+        `เชื่อมต่อไม่สำเร็จ เช็คว่า server (LM Studio / Ollama) เปิดอยู่และ base URL ตรง port (${baseUrl}) — ` +
+        (err && err.message ? err.message : err);
+    } finally {
+      testBtn.disabled = false;
+    }
+  });
+
+  document.getElementById('ai-generate-btn').addEventListener('click', async () => {
+    if (!currentPayload) return;
+    const btn = document.getElementById('ai-generate-btn');
+    const errorEl = document.getElementById('ai-error');
+    const outputEl = document.getElementById('ai-output');
+    const copyBtn = document.getElementById('ai-copy-btn');
+    const baseUrl = getBaseUrl();
+    const model = document.getElementById('ai-model').value || 'local-model';
+    const format = document.getElementById('ai-format').value;
+
+    errorEl.innerHTML = '';
+    outputEl.textContent = '';
+    copyBtn.disabled = true;
+    btn.disabled = true;
+    btn.textContent = 'Generating...';
+
+    try {
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: SYSTEM_PROMPTS[format] },
+            { role: 'user', content: JSON.stringify(currentPayload.compact) },
+          ],
+          temperature: 0.2,
+          max_tokens: 8192,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('HTTP ' + response.status);
+      }
+
+      const data = await response.json();
+      const choice = data && data.choices && data.choices[0];
+      const content = choice && choice.message ? choice.message.content : null;
+
+      if (!content) {
+        throw new Error('empty response from model');
+      }
+
+      outputEl.textContent = content.trim();
+      copyBtn.disabled = false;
+
+      if (choice.finish_reason === 'length') {
+        const div = document.createElement('div');
+        div.className = 'ai-error';
+        div.textContent =
+          'ผลลัพธ์อาจไม่ครบ — โมเดลตอบจน max_tokens เต็มก่อนเขียนจบ (ต้นไม้ node ใหญ่/ลึกเกินไปสำหรับโมเดลนี้) ' +
+          'ลองเลือก node ที่เล็กลง หรือใช้โมเดลที่รองรับ context/output ยาวกว่านี้';
+        errorEl.appendChild(div);
+      }
+    } catch (err) {
+      const div = document.createElement('div');
+      div.className = 'ai-error';
+      div.textContent =
+        `เรียก local LLM ไม่สำเร็จ เช็คว่า server เปิดอยู่และ base URL ตรง port (${baseUrl}) — ` +
+        (err && err.message ? err.message : err);
+      errorEl.appendChild(div);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Generate with local AI';
+    }
+  });
+</script>
