@@ -582,6 +582,164 @@ async function run() {
   assert.equal(untokenized.coverage.bound, 0);
   assert.equal(untokenized.typography[0].origin, 'value');
 
+  // --- Responsive (fluid) mode ---
+  // An opt-in second output. Every assertion above already proves the default
+  // (non-responsive) path is untouched, since none of it passes the new
+  // options param — these fixtures only check the *new* output.
+
+  const fillChild = {
+    id: 'fill-child',
+    type: 'FRAME',
+    name: 'Fill Child',
+    width: 100,
+    height: 40,
+    x: 8,
+    y: 8,
+    opacity: 1,
+    visible: true,
+    fills: [solid(1, 0, 0)],
+    strokes: [],
+    effects: [],
+    children: [],
+    layoutGrow: 1,
+    layoutSizingHorizontal: 'FILL',
+    layoutSizingVertical: 'FIXED',
+  };
+  const hugChild = {
+    id: 'hug-child',
+    type: 'FRAME',
+    name: 'Hug Child',
+    width: 60,
+    height: 40,
+    x: 116,
+    y: 8,
+    opacity: 1,
+    visible: true,
+    fills: [solid(0, 1, 0)],
+    strokes: [],
+    effects: [],
+    children: [],
+    layoutSizingHorizontal: 'HUG',
+    layoutSizingVertical: 'FIXED',
+  };
+  const fluidRow = {
+    id: 'fluid-row',
+    type: 'FRAME',
+    name: 'Fluid Row',
+    width: 300,
+    height: 56,
+    x: 0,
+    y: 0,
+    opacity: 1,
+    visible: true,
+    layoutMode: 'HORIZONTAL',
+    itemSpacing: 8,
+    paddingTop: 8,
+    paddingRight: 8,
+    paddingBottom: 8,
+    paddingLeft: 8,
+    fills: [],
+    strokes: [],
+    effects: [],
+    children: [fillChild, hugChild],
+  };
+
+  const rowHtml = await api.generateHtml(fluidRow);
+  // Fixed output: unchanged, both children keep their literal size.
+  assert.match(rowHtml.html, /\.fill-child \{[^}]*width: 100px;/s);
+  assert.match(rowHtml.html, /\.hug-child \{[^}]*width: 60px;/s);
+  // Fluid output: root shrinks below its design width but never grows past it;
+  // FILL drops its fixed width in favor of the already-emitted flex-grow, HUG
+  // drops it to size from content instead.
+  assert.match(rowHtml.responsiveHtml, /\.fluid-row \{[^}]*width: 100%;[^}]*max-width: 300px;/s);
+  assert.doesNotMatch(rowHtml.responsiveHtml, /\.fill-child \{[^}]*width:/s);
+  assert.match(rowHtml.responsiveHtml, /\.fill-child \{[^}]*flex-grow: 1;/s);
+  assert.doesNotMatch(rowHtml.responsiveHtml, /\.hug-child \{[^}]*width:/s);
+
+  const rowDart = await api.generateDart(fluidRow, { withResponsive: true });
+  // generateDart(node) with no 2nd arg (used elsewhere/by other tests) must
+  // still return a plain string — the responsive pair is opt-in only.
+  assert.equal(typeof (await api.generateDart(fluidRow)), 'string');
+  assert.match(rowDart.dart, /width: 300,/); // fixed root keeps its literal size
+  assert.match(rowDart.responsiveDart, /ConstrainedBox\(/);
+  assert.match(rowDart.responsiveDart, /constraints: const BoxConstraints\(maxWidth: 300\)/);
+  assert.match(rowDart.responsiveDart, /Expanded\(/); // FILL child on the main axis
+  assert.doesNotMatch(rowDart.responsiveDart, /width: 100,\n/); // fillChild's own width dropped
+
+  const anchorFrame = (id, name, extra) => ({
+    id,
+    type: 'FRAME',
+    name,
+    width: 50,
+    height: 30,
+    opacity: 1,
+    visible: true,
+    fills: [solid(0, 0, 1)],
+    strokes: [],
+    effects: [],
+    children: [],
+    ...extra,
+  });
+  const maxChild = {
+    ...anchorFrame('max-child', 'Max Child', { x: 340, y: 10, constraints: { horizontal: 'MAX', vertical: 'MIN' } }),
+    absoluteBoundingBox: { x: 340, y: 10, width: 50, height: 30 },
+  };
+  const stretchChild = {
+    ...anchorFrame('stretch-child', 'Stretch Child', {
+      x: 10,
+      y: 50,
+      width: 380,
+      height: 20,
+      constraints: { horizontal: 'STRETCH', vertical: 'MIN' },
+    }),
+    absoluteBoundingBox: { x: 10, y: 50, width: 380, height: 20 },
+  };
+  const scaleChild = {
+    ...anchorFrame('scale-child', 'Scale Child', {
+      x: 50,
+      y: 100,
+      width: 100,
+      height: 60,
+      constraints: { horizontal: 'SCALE', vertical: 'SCALE' },
+    }),
+    absoluteBoundingBox: { x: 50, y: 100, width: 100, height: 60 },
+  };
+  const anchorFrameNode = {
+    id: 'anchor-frame',
+    type: 'FRAME',
+    name: 'Anchor Frame',
+    width: 400,
+    height: 300,
+    x: 0,
+    y: 0,
+    opacity: 1,
+    visible: true,
+    fills: [],
+    strokes: [],
+    effects: [],
+    absoluteBoundingBox: { x: 0, y: 0, width: 400, height: 300 },
+    children: [maxChild, stretchChild, scaleChild],
+  };
+
+  const anchorHtml = await api.generateHtml(anchorFrameNode);
+  // Fixed: today's plain left/top + literal width/height, unchanged.
+  assert.match(anchorHtml.html, /\.max-child \{[^}]*left: 340px;/s);
+  // Fluid: MAX anchors from the far edge instead of the near one.
+  assert.match(anchorHtml.responsiveHtml, /\.max-child \{[^}]*right: 10px;/s);
+  assert.doesNotMatch(anchorHtml.responsiveHtml, /\.max-child \{[^}]*left:/s);
+  // STRETCH keeps both edges and drops the fixed width entirely.
+  assert.match(anchorHtml.responsiveHtml, /\.stretch-child \{[^}]*left: 10px;[^}]*right: 10px;/s);
+  assert.doesNotMatch(anchorHtml.responsiveHtml, /\.stretch-child \{[^}]*width:/s);
+  // SCALE converts both offset and size to percentages of the parent.
+  assert.match(anchorHtml.responsiveHtml, /\.scale-child \{[^}]*width: 25%;/s);
+  assert.match(anchorHtml.responsiveHtml, /\.scale-child \{[^}]*left: 12\.5%;/s);
+
+  const anchorDart = await api.generateDart(anchorFrameNode, { withResponsive: true });
+  assert.match(anchorDart.responsiveDart, /right: 10,/); // MAX
+  assert.match(anchorDart.responsiveDart, /left: 10,\n\s*right: 10,/); // STRETCH
+  assert.match(anchorDart.responsiveDart, /FractionallySizedBox\(/); // SCALE
+  assert.match(anchorDart.responsiveDart, /widthFactor: 0\.25,/);
+
   console.log('code regression tests passed');
 }
 

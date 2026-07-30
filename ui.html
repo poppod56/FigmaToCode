@@ -93,6 +93,16 @@
     background: #fff;
     color: inherit;
   }
+  .responsive-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .responsive-toggle input { cursor: pointer; }
   .hint {
     color: #8c8c8c;
     font-size: 10px;
@@ -233,6 +243,17 @@
 <div id="selection-row" class="select-row" style="display:none;">
   <select id="node-select"></select>
   <span id="selection-note" class="hint" style="margin:0;"></span>
+</div>
+
+<!-- Second, opt-in output alongside the fixed-pixel one above — never
+     replaces it. Only affects CSS/Flutter/HTML text; Preview always shows the
+     fixed-pixel render since it's compared against a fixed-size Figma export. -->
+<div id="responsive-row" class="select-row" style="display:none;">
+  <label class="responsive-toggle">
+    <input type="checkbox" id="responsive-toggle" />
+    Responsive (fluid)
+  </label>
+  <span class="hint" style="margin:0;">Uses Figma's own Fill/Hug/Constraints — not a guessed breakpoint.</span>
 </div>
 
 <div id="debug-send-row" class="debug-send-row" style="display:none;">
@@ -394,6 +415,7 @@
     document.getElementById('empty-state').style.display = 'none';
     document.getElementById('panels').style.display = 'block';
     document.getElementById('debug-send-row').style.display = 'flex';
+    document.getElementById('responsive-row').style.display = 'flex';
     if (debugConnected) sendDebugPayload(message);
 
     renderSelectionPicker(message);
@@ -432,9 +454,18 @@
     renderActiveNode();
   });
 
+  // Purely client-side — both variants already came in on the same message,
+  // so flipping this never needs to ask the plugin thread for anything.
+  let responsiveMode = false;
+  document.getElementById('responsive-toggle').addEventListener('change', (event) => {
+    responsiveMode = event.target.checked;
+    renderActiveNode();
+  });
+
   function renderActiveNode() {
     const payload = activePayload();
     if (!payload) return;
+    const source = responsiveMode && payload.responsive ? payload.responsive : payload;
 
     document.getElementById('css-node-name').textContent = payload.nodeName;
     document.getElementById('flutter-node-name').textContent = payload.nodeName;
@@ -443,6 +474,8 @@
       currentSelection.designSystem ? currentSelection.designSystem.name : payload.nodeName;
     document.getElementById('preview-node-name').textContent = payload.nodeName;
 
+    // Preview always compares against the fixed-pixel render — a fluid layout
+    // has no single "correct" size to hold the Figma export up against.
     renderPreview(payload);
 
     const warningsEl = document.getElementById('css-warnings');
@@ -455,9 +488,9 @@
     });
 
     document.getElementById('css-output').textContent =
-      '.' + safeSelector(payload.nodeName) + ' {\n' + formatCss(payload.css) + '\n}';
-    document.getElementById('flutter-output').textContent = payload.dart;
-    document.getElementById('html-output').textContent = payload.html;
+      '.' + safeSelector(payload.nodeName) + ' {\n' + formatCss(source.css) + '\n}';
+    document.getElementById('flutter-output').textContent = source.dart;
+    document.getElementById('html-output').textContent = source.html;
   }
 
   // Small card: bold name on top, muted detail underneath, optional pill on the right.
@@ -739,6 +772,7 @@
     document.getElementById('panels').style.display = 'none';
     document.getElementById('debug-send-row').style.display = 'none';
     document.getElementById('selection-row').style.display = 'none';
+    document.getElementById('responsive-row').style.display = 'none';
   }
 
   // Once connected, every new selection (render() call) gets pushed to the

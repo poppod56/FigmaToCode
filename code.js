@@ -1794,6 +1794,102 @@ function getTextCss(node) {
   return css;
 }
 
+// ---------- Responsive (fluid) mode ----------
+//
+// Opt-in, additive layer on top of the fixed-pixel output above. It never
+// guesses a breakpoint — it translates the exact per-node resize behavior
+// Figma already records (layoutSizingHorizontal/Vertical on auto-layout
+// children, `constraints` on freely-positioned ones) into the equivalent
+// fluid CSS. extractCss/getAutoLayoutCss/etc. above stay untouched; these
+// functions only ever mutate a copy of the css object a caller already built,
+// and only when that caller explicitly asks for it.
+
+// The outermost node of an export: shrinks below its design width instead of
+// staying pinned to it, but never grows past what was actually designed.
+function applyRootFluidCss(css, node) {
+  css.width = '100%';
+  css['max-width'] = `${round(node.width)}px`;
+}
+
+// A flex/grid child whose Figma sizing is FILL or HUG on the axis that matches
+// the parent's main axis: dropping the fixed dimension lets flex-grow (FILL,
+// already emitted unconditionally above) or the browser's own content sizing
+// (HUG) take over instead of pinning it to the size captured in this file.
+function applyFluidFlexSizing(css, node, parent) {
+  const mainHorizontal = parent.layoutMode === 'HORIZONTAL';
+  const mainSizing = mainHorizontal ? node.layoutSizingHorizontal : node.layoutSizingVertical;
+  const crossSizing = mainHorizontal ? node.layoutSizingVertical : node.layoutSizingHorizontal;
+  if (mainSizing === 'FILL' || mainSizing === 'HUG') delete css[mainHorizontal ? 'width' : 'height'];
+  // Cross-axis stretch is already flagged as align-self: stretch above; a
+  // fixed size alongside it is redundant once the layout is allowed to flex.
+  if (crossSizing === 'FILL' || node.layoutAlign === 'STRETCH') delete css[mainHorizontal ? 'height' : 'width'];
+}
+
+// Same idea for a CSS Grid child — its own layoutSizingHorizontal/Vertical and
+// grid alignment already live on the node itself, no parent axis lookup needed.
+function applyFluidGridSizing(css, node) {
+  if (node.layoutSizingHorizontal === 'FILL' || node.layoutSizingHorizontal === 'HUG' || node.gridChildHorizontalAlign === 'STRETCH') {
+    delete css.width;
+  }
+  if (node.layoutSizingVertical === 'FILL' || node.layoutSizingVertical === 'HUG' || node.gridChildVerticalAlign === 'STRETCH') {
+    delete css.height;
+  }
+}
+
+// A freely-positioned child (non-auto-layout parent, or flagged "Absolute
+// position" inside one) — this is exactly what Figma's Constraints panel
+// describes, translated one-for-one into the equivalent CSS anchoring.
+// `off` is the child's already-computed offset within `parent` (the same
+// value used to set css.left/top just above) — recomputing it here instead
+// would skip the border-inset adjustment the caller already applied and drift
+// a few pixels off on a stroked parent.
+function applyFluidConstraintCss(css, node, parent, off) {
+  const constraints = node.constraints;
+  if (!constraints || !parent || !off) return;
+
+  switch (constraints.horizontal) {
+    case 'MAX':
+      delete css.left;
+      css.right = `${round(parent.width - off.left - node.width)}px`;
+      break;
+    case 'CENTER':
+      css.left = '50%';
+      css['margin-left'] = `${round(-node.width / 2)}px`;
+      break;
+    case 'STRETCH':
+      css.right = `${round(parent.width - off.left - node.width)}px`;
+      delete css.width;
+      break;
+    case 'SCALE':
+      css.left = `${round((off.left / parent.width) * 100)}%`;
+      css.width = `${round((node.width / parent.width) * 100)}%`;
+      break;
+    default:
+      break; // MIN (default) — today's left/width stands unchanged.
+  }
+
+  switch (constraints.vertical) {
+    case 'MAX':
+      delete css.top;
+      css.bottom = `${round(parent.height - off.top - node.height)}px`;
+      break;
+    case 'CENTER':
+      css.top = '50%';
+      css['margin-top'] = `${round(-node.height / 2)}px`;
+      break;
+    case 'STRETCH':
+      css.bottom = `${round(parent.height - off.top - node.height)}px`;
+      delete css.height;
+      break;
+    case 'SCALE':
+      css.top = `${round((off.top / parent.height) * 100)}%`;
+      css.height = `${round((node.height / parent.height) * 100)}%`;
+      break;
+    default:
+      break;
+  }
+}
+
 function extractCss(node) {
   const css = {};
   const warnings = [];
@@ -2100,11 +2196,95 @@ async function collectFlutterAssets(node, assets) {
   }
 }
 
-function generateDartForNode(node, indent, assets) {
+// ---------- Responsive (fluid) Dart ----------
+//
+// Dart equivalents of the CSS transforms above, for the same two situations:
+// an auto-layout child sized FILL/HUG on its parent's main axis, and a
+// freely-positioned child governed by Figma's `constraints`. Grid children
+// are intentionally left out for v1 — Figma GRID has no native Flutter
+// widget, so it's already hand-rolled as a fixed Stack of Positioned
+// children; making that fluid needs the same percentage math as SCALE below
+// and was cut to keep this change reviewable.
+
+// The outermost widget: Flutter has no literal "100% width" the way CSS
+// does, so a ConstrainedBox capping at the design width plus the Container's
+// own width line being omitted (see omitWidth below) is the equivalent —
+// it sizes down to whatever the parent gives it, never up past the design.
+function fluidRootWrap(widget, node) {
+  return `ConstrainedBox(\n    constraints: const BoxConstraints(maxWidth: ${round(node.width)}),\n    child: ${widget},\n  )`;
+}
+
+// Alignment(-1..1, -1..1) is Flutter's own percentage-of-box coordinate
+// system — this is the same "% of parent" math as the CSS SCALE branch,
+// just expressed the way Align already expects it.
+function dartAlignmentFraction(off, size, parentSize) {
+  return round(((off + size / 2) / parentSize) * 2 - 1);
+}
+
+// A freely-positioned child with non-default constraints. Returns null for
+// the common MIN/MIN case so the caller falls back to today's plain
+// Positioned(left:, top:, child:) untouched.
+function dartFluidPositioned(child, parent, off, pad, innerWidget) {
+  const h = (child.constraints && child.constraints.horizontal) || 'MIN';
+  const v = (child.constraints && child.constraints.vertical) || 'MIN';
+  if (h === 'MIN' && v === 'MIN') return null;
+
+  if (h === 'SCALE' || v === 'SCALE') {
+    const widthFactor = round(child.width / parent.width);
+    const heightFactor = round(child.height / parent.height);
+    const alignX = dartAlignmentFraction(off.left, child.width, parent.width);
+    const alignY = dartAlignmentFraction(off.top, child.height, parent.height);
+    return (
+      `Positioned.fill(\n${pad}      child: Align(\n` +
+      `${pad}        alignment: const Alignment(${alignX}, ${alignY}),\n` +
+      `${pad}        child: FractionallySizedBox(\n` +
+      `${pad}          widthFactor: ${widthFactor},\n` +
+      `${pad}          heightFactor: ${heightFactor},\n` +
+      `${pad}          child: ${innerWidget},\n` +
+      `${pad}        ),\n${pad}      ),\n${pad}    )`
+    );
+  }
+
+  const edges = [];
+  if (h === 'MAX') edges.push(`right: ${round(parent.width - off.left - child.width)}`);
+  else if (h === 'STRETCH') {
+    edges.push(`left: ${round(off.left)}`, `right: ${round(parent.width - off.left - child.width)}`);
+  } else if (h === 'CENTER') edges.push('left: 0', 'right: 0');
+  else edges.push(`left: ${round(off.left)}`);
+
+  if (v === 'MAX') edges.push(`bottom: ${round(parent.height - off.top - child.height)}`);
+  else if (v === 'STRETCH') {
+    edges.push(`top: ${round(off.top)}`, `bottom: ${round(parent.height - off.top - child.height)}`);
+  } else if (v === 'CENTER') edges.push('top: 0', 'bottom: 0');
+  else edges.push(`top: ${round(off.top)}`);
+
+  const wrappedChild = h === 'CENTER' || v === 'CENTER' ? `Center(child: ${innerWidget})` : innerWidget;
+  const edgeLines = edges.map((edge) => `${pad}      ${edge},`).join('\n');
+  return `Positioned(\n${edgeLines}\n${pad}      child: ${wrappedChild},\n${pad}    )`;
+}
+
+// One child of a Stack (either the non-auto-layout root case or the
+// "Absolute position" overlay case inside an auto-layout frame) — both call
+// sites below share this so the fluid-vs-fixed branch only lives in one place.
+function dartPositionedChild(parent, child, off, pad, indent, assets, responsive) {
+  const childOptions = responsive ? { responsive: true, parent } : undefined;
+  const childWidget = generateDartForNode(child, indent + 3, assets, childOptions);
+  if (responsive) {
+    const positioned = dartFluidPositioned(child, parent, off, pad, childWidget);
+    if (positioned) return `${pad}    ${positioned}`;
+  }
+  return `${pad}    Positioned(\n${pad}      left: ${round(off.left)},\n${pad}      top: ${round(
+    off.top
+  )},\n${pad}      child: ${childWidget},\n${pad}    )`;
+}
+
+function generateDartForNode(node, indent, assets, options) {
   indent = indent || 0;
   const pad = '  '.repeat(indent);
   const name = sanitizeVarName(node.name);
   const asset = assets && assets.get(node.id);
+  const responsive = !!(options && options.responsive);
+  const parent = responsive ? options.parent || null : null;
 
   let inner;
   const visibleChildren = (node.children || []).filter(isRenderable);
@@ -2136,11 +2316,7 @@ function generateDartForNode(node, indent, assets) {
       // Positioned to match its real offset.
       const parts = visibleChildren.map((child) => {
         const off = childOffsetWithin(node, child);
-        return `${pad}    Positioned(\n${pad}      left: ${round(off.left)},\n${pad}      top: ${round(off.top)},\n${pad}      child: ${generateDartForNode(
-          child,
-          indent + 3,
-          assets
-        )},\n${pad}    )`;
+        return dartPositionedChild(node, child, off, pad, indent, assets, responsive);
       });
       inner = `Stack(\n${pad}  children: [\n${parts.join(',\n')},\n${pad}  ],\n${pad})`;
     } else {
@@ -2161,7 +2337,18 @@ function generateDartForNode(node, indent, assets) {
           const sizeProp = node.layoutMode === 'HORIZONTAL' ? 'width' : 'height';
           parts.push(`${pad}    SizedBox(${sizeProp}: ${round(gap)})`);
         }
-        parts.push(`${pad}    ${generateDartForNode(child, indent + 2, assets)}`);
+        const childOptions = responsive ? { responsive: true, parent: node } : undefined;
+        let childWidget = generateDartForNode(child, indent + 2, assets, childOptions);
+        if (responsive) {
+          // FILL on the main axis needs Expanded to actually claim the extra
+          // space — flex-grow's Dart equivalent, and the one case dropping the
+          // fixed dimension inside generateDartForNode isn't enough by itself.
+          const mainSizing = node.layoutMode === 'HORIZONTAL' ? child.layoutSizingHorizontal : child.layoutSizingVertical;
+          if (mainSizing === 'FILL') {
+            childWidget = `Expanded(\n${pad}    child: ${childWidget},\n${pad}  )`;
+          }
+        }
+        parts.push(`${pad}    ${childWidget}`);
       });
       const alignmentProps = [];
       if (node.primaryAxisAlignItems && PRIMARY_AXIS_ALIGN_FLUTTER[node.primaryAxisAlignItems]) {
@@ -2176,9 +2363,7 @@ function generateDartForNode(node, indent, assets) {
       if (overlayChildren.length > 0) {
         const overlayParts = overlayChildren.map((child) => {
           const off = childOffsetWithin(node, child);
-          return `${pad}    Positioned(\n${pad}      left: ${round(off.left)},\n${pad}      top: ${round(
-            off.top
-          )},\n${pad}      child: ${generateDartForNode(child, indent + 3, assets)},\n${pad}    )`;
+          return dartPositionedChild(node, child, off, pad, indent, assets, responsive);
         });
         inner = `Stack(\n${pad}  children: [\n${pad}    ${flowWidget},\n${overlayParts.join(',\n')},\n${pad}  ],\n${pad})`;
       } else {
@@ -2215,11 +2400,44 @@ function generateDartForNode(node, indent, assets) {
     }
   }
 
+  // Which dimensions to drop for a fluid child (asset exports always keep
+  // their exact rasterized size, fluid or not).
+  let omitWidth = false;
+  let omitHeight = false;
+  if (responsive && !asset) {
+    if (!parent) {
+      // Root: an explicit width here would make the wrapping ConstrainedBox
+      // in generateDart a no-op, since Container's own width wins over an
+      // ancestor's constraints. Height stays fixed for v1, same as the CSS
+      // root treatment in applyRootFluidCss.
+      omitWidth = true;
+    } else {
+      const isAutoLayoutParent = !!(parent.layoutMode && parent.layoutMode !== 'NONE');
+      const isFreePositioned = !isAutoLayoutParent || node.layoutPositioning === 'ABSOLUTE';
+      if (isFreePositioned && node.constraints) {
+        if (node.constraints.horizontal === 'STRETCH' || node.constraints.horizontal === 'SCALE') omitWidth = true;
+        if (node.constraints.vertical === 'STRETCH' || node.constraints.vertical === 'SCALE') omitHeight = true;
+      } else if (isAutoLayoutParent) {
+        const mainHorizontal = parent.layoutMode === 'HORIZONTAL';
+        const mainSizing = mainHorizontal ? node.layoutSizingHorizontal : node.layoutSizingVertical;
+        const crossSizing = mainHorizontal ? node.layoutSizingVertical : node.layoutSizingHorizontal;
+        if (mainSizing === 'FILL' || mainSizing === 'HUG') {
+          if (mainHorizontal) omitWidth = true;
+          else omitHeight = true;
+        }
+        if (crossSizing === 'FILL' || node.layoutAlign === 'STRETCH') {
+          if (mainHorizontal) omitHeight = true;
+          else omitWidth = true;
+        }
+      }
+    }
+  }
+  const widthLine = omitWidth ? '' : `\n${pad}  width: ${round(node.width)},`;
+  const heightLine = omitHeight ? '' : `\n${pad}  height: ${round(node.height)},`;
+
   let widget =
     `// ${name}\n` +
-    `${pad}Container(\n` +
-    `${pad}  width: ${round(node.width)},\n` +
-    `${pad}  height: ${round(node.height)},${decoCode}${paddingCode}\n` +
+    `${pad}Container(${widthLine}${heightLine}${decoCode}${paddingCode}\n` +
     `${pad}  child: ${inner},\n` +
     `${pad})`;
 
@@ -2236,18 +2454,27 @@ function generateDartForNode(node, indent, assets) {
   return widget;
 }
 
-async function generateDart(node) {
+// `options.withResponsive` is opt-in and additive: without it, this returns a
+// plain string exactly as before (existing callers, including the regression
+// test's `assert.match(assetDart, ...)`, depend on that shape). With it, the
+// asset export still only runs once — only the string-building step repeats.
+async function generateDart(node, options) {
   const assets = new Map();
   await collectFlutterAssets(node, assets);
   const imports = [`import 'package:flutter/material.dart';`];
   if (assets.size > 0) imports.unshift(`import 'dart:convert';`);
   const baseName = sanitizeVarName(node.name);
   const functionName = `build${baseName.charAt(0).toUpperCase()}${baseName.slice(1)}`;
-  return `${imports.join('\n')}\n\nWidget ${functionName}() {\n  return ${generateDartForNode(
-    node,
-    1,
-    assets
-  )};\n}`;
+
+  const build = (responsive) => {
+    let widget = generateDartForNode(node, 1, assets, responsive ? { responsive: true } : undefined);
+    if (responsive) widget = fluidRootWrap(widget, node);
+    return `${imports.join('\n')}\n\nWidget ${functionName}() {\n  return ${widget};\n}`;
+  };
+
+  const fixed = build(false);
+  if (!options || !options.withResponsive) return fixed;
+  return { dart: fixed, responsiveDart: build(true) };
 }
 
 // ---------- Full-tree HTML/CSS generation ----------
@@ -2378,11 +2605,21 @@ async function collectAssets(node, assets) {
   }
 }
 
-function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posOverride, flexChild, gridChild) {
+function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posOverride, flexChild, gridChild, options) {
   const pad = '  '.repeat(indent);
   const className = toClassName(node.name, node.type, usedNames);
   const { css, warnings: nodeWarnings } = extractCss(node);
   nodeWarnings.forEach((w) => warnings.push(w));
+
+  // `options.parent` is only set once this call is no longer the root — see
+  // the recursive call below, which is the sole place it gets threaded down.
+  const responsive = !!(options && options.responsive);
+  const parent = responsive ? options.parent || null : null;
+  const asset = assets.get(node.id);
+
+  if (responsive && !asset) {
+    if (!parent) applyRootFluidCss(css, node);
+  }
 
   // A non-auto-layout Figma frame positions children freely by x/y (can
   // overlap, float anywhere) — normal HTML block flow can't reproduce that,
@@ -2391,6 +2628,7 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
     css.position = 'absolute';
     css.left = `${round(posOverride.left)}px`;
     css.top = `${round(posOverride.top)}px`;
+    if (responsive && !asset) applyFluidConstraintCss(css, node, parent, posOverride);
   }
 
   if (flexChild) {
@@ -2400,6 +2638,7 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
     css['flex-shrink'] = '0';
     if (node.layoutGrow === 1) css['flex-grow'] = '1';
     if (node.layoutAlign === 'STRETCH') css['align-self'] = 'stretch';
+    if (responsive && !asset && parent) applyFluidFlexSizing(css, node, parent);
   }
 
   if (gridChild) {
@@ -2417,9 +2656,9 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
     const verticalAlign = GRID_ITEM_ALIGN_CSS[node.gridChildVerticalAlign];
     if (horizontalAlign) css['justify-self'] = horizontalAlign;
     if (verticalAlign) css['align-self'] = verticalAlign;
+    if (responsive && !asset) applyFluidGridSizing(css, node);
   }
 
-  const asset = assets.get(node.id);
   if (asset) {
     if (node.rotation) {
       // Figma's export renders the node as it appears, rotation already baked
@@ -2522,7 +2761,8 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
           assets,
           childOverride,
           !childNeedsAbsolute && !childIsGridItem,
-          childIsGridItem
+          childIsGridItem,
+          responsive ? { responsive: true, parent: node } : undefined
         );
       })
       .join('\n');
@@ -2531,14 +2771,25 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
   return `${pad}<div class="${className}"></div>`;
 }
 
-async function generateHtml(node) {
-  const assets = new Map();
-  await collectAssets(node, assets);
-
+// Shared by both the fixed and the fluid build below — same tree walk, same
+// asset map (exportAsync already ran once by the time this is called), only
+// the `responsive` flag differs.
+function buildHtmlDocument(node, assets, responsive) {
   const usedNames = new Set();
   const rules = [];
   const warnings = [];
-  const body = generateHtmlTree(node, usedNames, rules, warnings, 0, assets);
+  const body = generateHtmlTree(
+    node,
+    usedNames,
+    rules,
+    warnings,
+    0,
+    assets,
+    null,
+    false,
+    false,
+    responsive ? { responsive: true } : undefined
+  );
 
   // Figma sizes include the stroke (its default stroke align is inside), and
   // <p> carries a default margin. Scope the reset to the generated root so
@@ -2553,6 +2804,19 @@ async function generateHtml(node) {
     html: `${body}\n\n<style>\n${allRules.join('\n\n')}\n</style>`,
     // Deduped: the same caveat usually repeats across many sibling nodes.
     warnings: warnings.filter((w, i) => warnings.indexOf(w) === i),
+  };
+}
+
+async function generateHtml(node) {
+  const assets = new Map();
+  await collectAssets(node, assets);
+
+  const fixed = buildHtmlDocument(node, assets, false);
+  const fluid = buildHtmlDocument(node, assets, true);
+  return {
+    html: fixed.html,
+    warnings: fixed.warnings,
+    responsiveHtml: fluid.html,
   };
 }
 
@@ -2831,7 +3095,7 @@ function buildRawNode(node, bindings) {
 
 async function buildNodePayload(node, bindings, extraWarnings) {
   const { css, warnings } = extractCss(node);
-  const dart = await generateDart(node);
+  const dartResult = await generateDart(node, { withResponsive: true });
   const htmlResult = await generateHtml(node);
   const compact = buildCompactNode(node, bindings);
   const preview = await exportPreviewPng(node);
@@ -2844,6 +3108,12 @@ async function buildNodePayload(node, bindings, extraWarnings) {
     .concat(htmlResult.warnings, extraWarnings || [])
     .filter((w, i, a) => a.indexOf(w) === i);
 
+  // Fluid variant of the CSS tab's flat single-node rule: from that view this
+  // selected node *is* the root, so it gets the same treatment generateHtml's
+  // root call gets — see applyRootFluidCss.
+  const responsiveCss = { ...css };
+  applyRootFluidCss(responsiveCss, node);
+
   return {
     nodeId: node.id,
     nodeName: node.name,
@@ -2852,9 +3122,19 @@ async function buildNodePayload(node, bindings, extraWarnings) {
     height: round(node.height),
     css,
     warnings: allWarnings,
-    dart,
+    dart: dartResult.dart,
     html: htmlResult.html,
     compact,
+    // Opt-in fluid export — see plan doc / code comments near
+    // applyRootFluidCss, applyFluidFlexSizing, applyFluidConstraintCss,
+    // fluidRootWrap, dartFluidPositioned. Never used unless the UI's
+    // "Responsive (fluid)" toggle is on; the keys above are the unchanged
+    // fixed-pixel output.
+    responsive: {
+      css: responsiveCss,
+      dart: dartResult.responsiveDart,
+      html: htmlResult.responsiveHtml,
+    },
     previewImage: preview ? preview.uri : null,
     previewCrop: preview ? preview.crop : null,
     raw,
