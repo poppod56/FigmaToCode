@@ -4,13 +4,9 @@ A Figma plugin that inspects the selected layer(s) and generates CSS, Flutter
 (Dart), and HTML on the spot — entirely inside the Figma sandbox, no server,
 no account, no data leaving your machine.
 
-<!-- TODO: screenshot / gif here once available. Suggested shots:
-     1. Plugin panel open next to a selected frame (CSS tab).
-     2. Design System tab showing variables/styles/components.
-     3. Responsive toggle before/after on a Fill/Hug + constrained layout.
-     4. Preview tab: Figma render vs. generated HTML, side by side.
-     Drop the file at docs/screenshot.png (or .gif) and uncomment:
-     ![screenshot](docs/screenshot.png) -->
+## Demo
+
+![FigmaToCode plugin demo](docs/figma-to-code-demo.gif)
 
 ## Features
 
