@@ -33,8 +33,9 @@ out/
 # ========================
 # Figma Plugin
 # ========================
-# Figma Desktop debug files
-.debug-server/
+# Keep the local debug helper itself in Git; only its generated captures stay local.
+.debug-server/data/
+.debug-server/server.log
 
 # ========================
 # Editor & IDE
