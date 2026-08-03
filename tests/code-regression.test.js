@@ -424,6 +424,145 @@ async function run() {
   assert.match(assetDart, /Widget buildIcon\(\)/);
   assert.match(assetDart, /Image\.memory\(base64Decode\('BASE64_DATA'\)/);
 
+  // --- Asset pipeline (real files instead of inline base64) ---
+
+  // generateDart(node) with no 2nd arg — used just above — must keep
+  // returning a plain string; the asset manifest is opt-in via withResponsive.
+  const assetDartExpanded = await api.generateDart(vectorAsset, { withResponsive: true });
+  assert.equal(assetDartExpanded.dart, assetDart);
+  assert.equal(assetDartExpanded.assets.length, 1);
+  assert.equal(assetDartExpanded.assets[0].filename, 'icon.png');
+  assert.equal(assetDartExpanded.assets[0].mimeType, 'image/png');
+  assert.equal(assetDartExpanded.assets[0].base64, 'BASE64_DATA');
+  assert.equal(assetDartExpanded.assets[0].width, 24);
+  assert.equal(assetDartExpanded.assets[0].height, 24);
+
+  const assetHtml = await api.generateHtml(vectorAsset);
+  assert.equal(assetHtml.assets.length, 1);
+  assert.equal(assetHtml.assets[0].filename, 'icon.svg');
+  assert.equal(assetHtml.assets[0].mimeType, 'image/svg+xml');
+  assert.equal(assetHtml.assets[0].dataUri, 'data:image/svg+xml;base64,BASE64_DATA');
+  assert.match(assetHtml.html, /url\("data:image\/svg\+xml;base64,BASE64_DATA"\)/);
+
+  // An exported child may paint far outside its logical frame (the real
+  // trimming selector does this: a 150.55px frame owns a 317px boolean path
+  // plus shadow). The layout box must stay 150.55px while the asset is drawn
+  // at its full 325x61 render bounds and real negative offset.
+  const overflowAsset = {
+    id: 'frame:overflow-asset',
+    type: 'FRAME',
+    name: 'Select',
+    x: 1,
+    y: 26,
+    width: 150.55,
+    height: 50,
+    opacity: 1,
+    visible: true,
+    layoutMode: 'NONE',
+    layoutPositioning: 'ABSOLUTE',
+    fills: [],
+    strokes: [],
+    effects: [],
+    clipsContent: false,
+    absoluteBoundingBox: { x: 1, y: 26, width: 150.55, height: 50 },
+    absoluteRenderBounds: { x: -3, y: 20.5, width: 325, height: 61 },
+    children: [
+      {
+        id: 'boolean:overflow-art',
+        type: 'BOOLEAN_OPERATION',
+        name: 'Selector art',
+        width: 317,
+        height: 50,
+        opacity: 1,
+        visible: true,
+        fills: [solid(1, 1, 1)],
+        strokes: [],
+        effects: [],
+        children: [],
+      },
+    ],
+    async exportAsync() {
+      return new Uint8Array([1, 2, 3]);
+    },
+  };
+  const overflowRoot = {
+    id: 'frame:overflow-root',
+    type: 'FRAME',
+    name: 'Overflow Root',
+    width: 319,
+    height: 97,
+    opacity: 1,
+    visible: true,
+    layoutMode: 'VERTICAL',
+    itemSpacing: 8,
+    paddingTop: 0,
+    paddingRight: 0,
+    paddingBottom: 0,
+    paddingLeft: 0,
+    fills: [],
+    strokes: [],
+    effects: [],
+    clipsContent: false,
+    absoluteBoundingBox: { x: 0, y: 0, width: 319, height: 97 },
+    absoluteRenderBounds: { x: -3, y: 0, width: 325, height: 97 },
+    children: [
+      {
+        id: 'rect:flow-child',
+        type: 'RECTANGLE',
+        name: 'Flow Child',
+        x: 0,
+        y: 0,
+        width: 319,
+        height: 22,
+        opacity: 1,
+        visible: true,
+        fills: [],
+        strokes: [],
+        effects: [],
+        absoluteBoundingBox: { x: 0, y: 0, width: 319, height: 22 },
+        children: [],
+      },
+      overflowAsset,
+    ],
+  };
+
+  const overflowHtml = await api.generateHtml(overflowRoot);
+  assert.match(overflowHtml.html, /\.select \{[\s\S]*?width: 150\.55px;[\s\S]*?height: 50px;/);
+  assert.match(
+    overflowHtml.html,
+    /\.select::before \{[\s\S]*?left: -4px;[\s\S]*?top: -5\.5px;[\s\S]*?width: 325px;[\s\S]*?height: 61px;/
+  );
+  assert.match(overflowHtml.html, /background-size: 100% 100%;/);
+
+  const overflowDart = await api.generateDart(overflowRoot, { withResponsive: true });
+  assert.match(overflowDart.dart, /clipBehavior: Clip\.none/);
+  assert.match(
+    overflowDart.dart,
+    /left: -4,[\s\S]*?top: -5\.5,[\s\S]*?Image\.memory\([\s\S]*?width: 325, height: 61/
+  );
+  assert.equal(overflowDart.assets[0].width, 325);
+  assert.equal(overflowDart.assets[0].height, 61);
+  assert.equal(overflowDart.assets[0].offsetX, -4);
+  assert.equal(overflowDart.assets[0].offsetY, -5.5);
+
+  // Two same-named assets dedupe like design-system tokens do (icon.png, icon-2.png).
+  const secondIcon = { ...vectorAsset, id: 'vector:asset-2' };
+  const dualIconFrame = {
+    id: 'frame:dual-icon',
+    type: 'FRAME',
+    name: 'Icon Row',
+    width: 60,
+    height: 24,
+    opacity: 1,
+    visible: true,
+    fills: [],
+    strokes: [],
+    effects: [],
+    children: [vectorAsset, secondIcon],
+  };
+  const dualIconDart = await api.generateDart(dualIconFrame, { withResponsive: true });
+  assert.equal(dualIconDart.assets.map((a) => a.filename).join(','), 'icon.png,icon-2.png');
+
   // --- Variables, styles, and component instances ---
 
   const buttonComponent = {

@@ -275,6 +275,16 @@
     <div class="node-name" id="flutter-node-name"></div>
     <pre class="code-block" id="flutter-output"></pre>
     <button class="copy-btn" data-copy="flutter-output">Copy Dart</button>
+    <button class="copy-btn" id="flutter-assets-btn" style="display:none;">Download images + copy code</button>
+    <div id="flutter-assets-hint" class="hint" style="display:none;">
+      Downloads each image as a real file, then copies the code above with Image.asset('assets/...') paths instead of
+      inline data — your browser may ask to allow multiple downloads.
+    </div>
+    <div id="flutter-pubspec-wrap" style="display:none;">
+      <div class="system-title">pubspec.yaml additions</div>
+      <pre class="code-block" id="flutter-pubspec-output"></pre>
+      <button class="copy-btn" data-copy="flutter-pubspec-output">Copy pubspec snippet</button>
+    </div>
   </div>
 
   <div class="panel" id="panel-html">
@@ -282,6 +292,11 @@
     <div class="hint">Full node tree, recursively — one &lt;div&gt;/&lt;p&gt; per node plus a matching &lt;style&gt; block.</div>
     <pre class="code-block" id="html-output"></pre>
     <button class="copy-btn" data-copy="html-output">Copy HTML</button>
+    <button class="copy-btn" id="html-assets-btn" style="display:none;">Download images + copy code</button>
+    <div id="html-assets-hint" class="hint" style="display:none;">
+      Downloads each image as a real file, then copies the code above with assets/... paths instead of inline data —
+      your browser may ask to allow multiple downloads.
+    </div>
   </div>
 
   <div class="panel" id="panel-design">
@@ -491,7 +506,126 @@
       '.' + safeSelector(payload.nodeName) + ' {\n' + formatCss(source.css) + '\n}';
     document.getElementById('flutter-output').textContent = source.dart;
     document.getElementById('html-output').textContent = source.html;
+
+    renderAssetControls(payload);
   }
+
+  // ---------- Asset pipeline: real files instead of inline base64 ----------
+  // A one-shot export action (not a live toggle like Responsive) — only
+  // matters when the user is about to actually use the code, not while
+  // browsing tabs. Every asset is already on the payload as {filename,
+  // base64/dataUri, mimeType, ...}; everything below is pure client-side
+  // string rewriting + a Blob download, no round trip to the plugin thread.
+
+  function renderAssetControls(payload) {
+    const htmlAssets = payload.htmlAssets || [];
+    const dartAssets = payload.dartAssets || [];
+
+    document.getElementById('html-assets-btn').style.display = htmlAssets.length > 0 ? 'inline-block' : 'none';
+    document.getElementById('html-assets-hint').style.display = htmlAssets.length > 0 ? 'block' : 'none';
+
+    document.getElementById('flutter-assets-btn').style.display = dartAssets.length > 0 ? 'inline-block' : 'none';
+    document.getElementById('flutter-assets-hint').style.display = dartAssets.length > 0 ? 'block' : 'none';
+    document.getElementById('flutter-pubspec-wrap').style.display = dartAssets.length > 0 ? 'block' : 'none';
+    document.getElementById('flutter-pubspec-output').textContent = buildPubspecSnippet(dartAssets);
+  }
+
+  function buildPubspecSnippet(assetsManifest) {
+    if (assetsManifest.length === 0) return '';
+    const lines = ['flutter:', '  assets:'];
+    assetsManifest.forEach((asset) => lines.push(`    - assets/${asset.filename}`));
+    return lines.join('\n');
+  }
+
+  function downloadBase64File(filename, base64, mimeType) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const blob = new Blob([bytes], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    // Give the browser a moment to actually start the download before the
+    // object URL backing it disappears.
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  // The data URI is unique per asset, so a literal split/join is exact and
+  // sidesteps regex-escaping a base64 blob.
+  function rewriteHtmlWithAssetPaths(html, assetsManifest) {
+    let result = html;
+    assetsManifest.forEach((asset) => {
+      result = result.split(asset.dataUri).join(`assets/${asset.filename}`);
+    });
+    return result;
+  }
+
+  // Reconstructs the exact `Image.memory(...)` call generateDartForNode
+  // produces for this asset (same base64/width/height it was built from) and
+  // swaps it for the Image.asset(...) equivalent — same idea as the HTML
+  // rewrite, just a bigger substring since Dart needs the whole call replaced,
+  // not only the encoded value.
+  function rewriteDartWithAssetPaths(dart, assetsManifest) {
+    let result = dart;
+    assetsManifest.forEach((asset) => {
+      const oldCall =
+        `Image.memory(base64Decode('${asset.base64}'), width: ${asset.width}, height: ${asset.height}, ` +
+        'fit: BoxFit.fill, gaplessPlayback: true)';
+      const newCall = `Image.asset('assets/${asset.filename}', width: ${asset.width}, height: ${asset.height}, fit: BoxFit.fill)`;
+      result = result.split(oldCall).join(newCall);
+    });
+    return result;
+  }
+
+  async function exportAssetsAndCopy(assetsManifest, text, rewriteFn, btn) {
+    const original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Downloading...';
+    for (let i = 0; i < assetsManifest.length; i++) {
+      downloadBase64File(assetsManifest[i].filename, assetsManifest[i].base64, assetsManifest[i].mimeType);
+      // Firing every download in the same tick makes some browsers silently
+      // drop all but the first — a small stagger keeps each one landing.
+      if (i < assetsManifest.length - 1) await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    try {
+      await copyText(rewriteFn(text, assetsManifest));
+      btn.textContent = `Downloaded ${assetsManifest.length} + copied!`;
+    } catch (e) {
+      btn.textContent = 'Downloaded, but copy failed';
+    }
+    setTimeout(() => {
+      btn.textContent = original;
+      btn.disabled = false;
+    }, 1800);
+  }
+
+  document.getElementById('html-assets-btn').addEventListener('click', () => {
+    const payload = activePayload();
+    if (!payload) return;
+    const source = responsiveMode && payload.responsive ? payload.responsive : payload;
+    exportAssetsAndCopy(
+      payload.htmlAssets || [],
+      source.html,
+      rewriteHtmlWithAssetPaths,
+      document.getElementById('html-assets-btn')
+    );
+  });
+
+  document.getElementById('flutter-assets-btn').addEventListener('click', () => {
+    const payload = activePayload();
+    if (!payload) return;
+    const source = responsiveMode && payload.responsive ? payload.responsive : payload;
+    exportAssetsAndCopy(
+      payload.dartAssets || [],
+      source.dart,
+      rewriteDartWithAssetPaths,
+      document.getElementById('flutter-assets-btn')
+    );
+  });
 
   // Small card: bold name on top, muted detail underneath, optional pill on the right.
   function systemCard(name, meta, badge) {

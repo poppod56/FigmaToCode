@@ -1605,6 +1605,25 @@ function getBlurCss(node) {
   };
 }
 
+// CSS blur(radius) is defined as a Gaussian with stdDev = radius / 2, and
+// Flutter's ImageFilter.blur sigma IS that stdDev — halving here keeps the
+// Dart output visually in sync with the blur() emitted above for CSS.
+function getDartLayerBlurSigma(node) {
+  if (!node.effects || node.effects.length === 0) return null;
+  let layerBlur = null;
+  node.effects.forEach((e) => {
+    if (e.visible === false) return;
+    if (e.type === 'LAYER_BLUR') layerBlur = e.radius;
+  });
+  return layerBlur !== null ? round(layerBlur / 2) : null;
+}
+
+function treeHasLayerBlur(node) {
+  if (!node) return false;
+  if (node.effects && node.effects.some((e) => e.visible !== false && e.type === 'LAYER_BLUR')) return true;
+  return (node.children || []).some((child) => treeHasLayerBlur(child));
+}
+
 const PRIMARY_AXIS_ALIGN_CSS = {
   MIN: 'flex-start',
   CENTER: 'center',
@@ -2185,7 +2204,17 @@ async function collectFlutterAssets(node, assets) {
   ) {
     try {
       const bytes = await node.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 2 } });
-      assets.set(node.id, figma.base64Encode(bytes));
+      // Render geometry is captured alongside the bytes so both the inline
+      // Image.memory and downloaded Image.asset paths reproduce the same
+      // overflow/shadow rectangle.
+      const geometry = assetRenderGeometry(node);
+      assets.set(node.id, {
+        base64: figma.base64Encode(bytes),
+        mimeType: 'image/png',
+        ext: 'png',
+        nodeName: node.name,
+        ...geometry,
+      });
       return;
     } catch (e) {
       // Fall through to editable widgets when an asset cannot be exported.
@@ -2290,9 +2319,12 @@ function generateDartForNode(node, indent, assets, options) {
   const visibleChildren = (node.children || []).filter(isRenderable);
 
   if (asset) {
-    inner = `Image.memory(base64Decode('${asset}'), width: ${round(node.width)}, height: ${round(
-      node.height
-    )}, fit: BoxFit.fill, gaplessPlayback: true)`;
+    const image = `Image.memory(base64Decode('${asset.base64}'), width: ${asset.width}, height: ${asset.height}, fit: BoxFit.fill, gaplessPlayback: true)`;
+    if (asset.differsFromNodeBounds) {
+      inner = `Stack(\n${pad}  clipBehavior: Clip.none,\n${pad}  children: [\n${pad}    Positioned(\n${pad}      left: ${asset.offsetX},\n${pad}      top: ${asset.offsetY},\n${pad}      child: ${image},\n${pad}    ),\n${pad}  ],\n${pad})`;
+    } else {
+      inner = image;
+    }
   } else if (node.type === 'TEXT') {
     inner = generateDartTextWidget(node, pad);
   } else if (visibleChildren.length > 0) {
@@ -2318,7 +2350,8 @@ function generateDartForNode(node, indent, assets, options) {
         const off = childOffsetWithin(node, child);
         return dartPositionedChild(node, child, off, pad, indent, assets, responsive);
       });
-      inner = `Stack(\n${pad}  children: [\n${parts.join(',\n')},\n${pad}  ],\n${pad})`;
+      const clipCode = node.clipsContent === true ? '' : `\n${pad}  clipBehavior: Clip.none,`;
+      inner = `Stack(${clipCode}\n${pad}  children: [\n${parts.join(',\n')},\n${pad}  ],\n${pad})`;
     } else {
       // Even inside an auto-layout frame, an individual child can be flagged
       // "Absolute position" in Figma to detach it from the flex flow and
@@ -2365,7 +2398,8 @@ function generateDartForNode(node, indent, assets, options) {
           const off = childOffsetWithin(node, child);
           return dartPositionedChild(node, child, off, pad, indent, assets, responsive);
         });
-        inner = `Stack(\n${pad}  children: [\n${pad}    ${flowWidget},\n${overlayParts.join(',\n')},\n${pad}  ],\n${pad})`;
+        const clipCode = node.clipsContent === true ? '' : `\n${pad}  clipBehavior: Clip.none,`;
+        inner = `Stack(${clipCode}\n${pad}  children: [\n${pad}    ${flowWidget},\n${overlayParts.join(',\n')},\n${pad}  ],\n${pad})`;
       } else {
         inner = flowWidget;
       }
@@ -2451,6 +2485,11 @@ function generateDartForNode(node, indent, assets, options) {
     widget = `Opacity(\n${pad}  opacity: ${round(node.opacity)},\n${pad}  child: ${widget},\n${pad})`;
   }
 
+  const blurSigma = getDartLayerBlurSigma(node);
+  if (blurSigma) {
+    widget = `ImageFiltered(\n${pad}  imageFilter: ImageFilter.blur(sigmaX: ${blurSigma}, sigmaY: ${blurSigma}),\n${pad}  child: ${widget},\n${pad})`;
+  }
+
   return widget;
 }
 
@@ -2461,8 +2500,10 @@ function generateDartForNode(node, indent, assets, options) {
 async function generateDart(node, options) {
   const assets = new Map();
   await collectFlutterAssets(node, assets);
-  const imports = [`import 'package:flutter/material.dart';`];
-  if (assets.size > 0) imports.unshift(`import 'dart:convert';`);
+  const imports = [];
+  if (treeHasLayerBlur(node)) imports.push(`import 'dart:ui';`);
+  if (assets.size > 0) imports.push(`import 'dart:convert';`);
+  imports.push(`import 'package:flutter/material.dart';`);
   const baseName = sanitizeVarName(node.name);
   const functionName = `build${baseName.charAt(0).toUpperCase()}${baseName.slice(1)}`;
 
@@ -2474,10 +2515,25 @@ async function generateDart(node, options) {
 
   const fixed = build(false);
   if (!options || !options.withResponsive) return fixed;
-  return { dart: fixed, responsiveDart: build(true) };
+  return { dart: fixed, responsiveDart: build(true), assets: nameAssetFiles(assets) };
 }
 
 // ---------- Full-tree HTML/CSS generation ----------
+
+// Turns a collected assets Map into a named, deduped array — the "real file"
+// side of the asset pipeline. slugToken already does this exact job for
+// design tokens; borrowed here as the file base name so two icons named
+// "Icon" become icon.png/icon-2.png instead of colliding.
+function nameAssetFiles(assets) {
+  const used = new Map();
+  return Array.from(assets.entries()).map(([nodeId, entry]) => {
+    const base = slugToken(entry.nodeName || 'asset');
+    const count = (used.get(base) || 0) + 1;
+    used.set(base, count);
+    const filename = count > 1 ? `${base}-${count}.${entry.ext}` : `${base}.${entry.ext}`;
+    return { nodeId, filename, ...entry };
+  });
+}
 
 function toClassName(name, type, usedNames) {
   let base = (name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
@@ -2531,6 +2587,41 @@ function renderedSize(node) {
   return box ? { width: box.width, height: box.height } : { width: node.width, height: node.height };
 }
 
+// Figma exports the painted/rendered rectangle, not necessarily the node's
+// logical layout rectangle. Shadows and non-clipping children can make it
+// larger (or an unfilled wrapper can make it smaller), so fitting that export
+// back into node.width/node.height scales and shifts the artwork. Preserve the
+// layout box separately and place the exported pixels at their real offset.
+function assetRenderGeometry(node) {
+  const box = node.absoluteBoundingBox;
+  const render = node.absoluteRenderBounds;
+  if (!box || !render || render.width <= 0 || render.height <= 0) {
+    const size = renderedSize(node);
+    return {
+      width: round(size.width),
+      height: round(size.height),
+      offsetX: 0,
+      offsetY: 0,
+      differsFromNodeBounds: false,
+    };
+  }
+
+  const offsetX = render.x - box.x;
+  const offsetY = render.y - box.y;
+  const epsilon = 0.01;
+  return {
+    width: round(render.width),
+    height: round(render.height),
+    offsetX: round(offsetX),
+    offsetY: round(offsetY),
+    differsFromNodeBounds:
+      Math.abs(offsetX) > epsilon ||
+      Math.abs(offsetY) > epsilon ||
+      Math.abs(render.width - box.width) > epsilon ||
+      Math.abs(render.height - box.height) > epsilon,
+  };
+}
+
 // Width of the border we emit for a node, which CSS counts inside the padding
 // box — absolutely positioned children anchor to the padding box, so their
 // offsets have to be pulled back by it to land where Figma puts them.
@@ -2577,7 +2668,16 @@ async function collectAssets(node, assets) {
   if (isVectorOnlySubtree(node)) {
     try {
       const bytes = await node.exportAsync({ format: 'SVG' });
-      assets.set(node.id, `data:image/svg+xml;base64,${figma.base64Encode(bytes)}`);
+      const base64 = figma.base64Encode(bytes);
+      const geometry = assetRenderGeometry(node);
+      assets.set(node.id, {
+        dataUri: `data:image/svg+xml;base64,${base64}`,
+        base64,
+        mimeType: 'image/svg+xml',
+        ext: 'svg',
+        nodeName: node.name,
+        ...geometry,
+      });
     } catch (e) {
       // leave unexported — falls back to an empty box rather than failing the whole export
     }
@@ -2592,7 +2692,16 @@ async function collectAssets(node, assets) {
   if (needsRasterFill(node) || rotatedContainer) {
     try {
       const bytes = await node.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 2 } });
-      assets.set(node.id, `data:image/png;base64,${figma.base64Encode(bytes)}`);
+      const base64 = figma.base64Encode(bytes);
+      const geometry = assetRenderGeometry(node);
+      assets.set(node.id, {
+        dataUri: `data:image/png;base64,${base64}`,
+        base64,
+        mimeType: 'image/png',
+        ext: 'png',
+        nodeName: node.name,
+        ...geometry,
+      });
       if (rotatedContainer) return; // its children are baked into the image
     } catch (e) {
       // same fallback as above
@@ -2616,6 +2725,7 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
   const responsive = !!(options && options.responsive);
   const parent = responsive ? options.parent || null : null;
   const asset = assets.get(node.id);
+  let assetVisualRule = null;
 
   if (responsive && !asset) {
     if (!parent) applyRootFluidCss(css, node);
@@ -2688,9 +2798,29 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
       if (node.width === 0) css.width = `${round(strokeWeight)}px`;
       if (node.height === 0) css.height = `${round(strokeWeight)}px`;
     }
-    css['background-image'] = `url("${asset}")`;
-    css['background-size'] = 'contain';
-    css['background-repeat'] = 'no-repeat';
+    if (asset.differsFromNodeBounds) {
+      // Keep this element at the logical Figma size so flex/absolute layout is
+      // unchanged, while a paint-only layer carries the larger exported
+      // render (overflowing children, strokes, and shadows included).
+      css.position = css.position || 'relative';
+      delete css.overflow;
+      assetVisualRule = `.${className}::before {\n` +
+        `  content: "";\n` +
+        `  position: absolute;\n` +
+        `  left: ${asset.offsetX}px;\n` +
+        `  top: ${asset.offsetY}px;\n` +
+        `  width: ${asset.width}px;\n` +
+        `  height: ${asset.height}px;\n` +
+        `  background-image: url("${asset.dataUri}");\n` +
+        `  background-size: 100% 100%;\n` +
+        `  background-repeat: no-repeat;\n` +
+        `  pointer-events: none;\n` +
+        `}`;
+    } else {
+      css['background-image'] = `url("${asset.dataUri}")`;
+      css['background-size'] = 'contain';
+      css['background-repeat'] = 'no-repeat';
+    }
 
     // The export can bake in the fill itself but not how that fill blends with
     // what sits behind the node — that only happens at composite time, so it
@@ -2729,6 +2859,7 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
     .map((k) => `  ${k}: ${css[k]};`)
     .join('\n');
   rules.push(`.${className} {\n${body}\n}`);
+  if (assetVisualRule) rules.push(assetVisualRule);
 
   // Exported as a flattened image — don't also emit its (now-redundant) vector sub-paths.
   if (asset) {
@@ -2817,6 +2948,10 @@ async function generateHtml(node) {
     html: fixed.html,
     warnings: fixed.warnings,
     responsiveHtml: fluid.html,
+    // Named, deduped asset files — see nameAssetFiles. The ui.html "download
+    // images" action decodes these and swaps the matching data URI in the
+    // html string above for a real assets/<filename> path.
+    assets: nameAssetFiles(assets),
   };
 }
 
@@ -2984,6 +3119,7 @@ function buildRawNode(node, bindings) {
     opacity: node.opacity,
     blendMode: node.blendMode,
     absoluteBoundingBox: node.absoluteBoundingBox,
+    absoluteRenderBounds: node.absoluteRenderBounds,
   };
 
   if ('layoutMode' in node) raw.layoutMode = node.layoutMode;
@@ -3135,6 +3271,12 @@ async function buildNodePayload(node, bindings, extraWarnings) {
       dart: dartResult.responsiveDart,
       html: htmlResult.responsiveHtml,
     },
+    // Real, named, downloadable files for whatever collectAssets/
+    // collectFlutterAssets embedded as base64 above — the ui.html "Download
+    // images" action decodes these and rewrites the copied code to reference
+    // them by path instead of inline data.
+    htmlAssets: htmlResult.assets,
+    dartAssets: dartResult.assets,
     previewImage: preview ? preview.uri : null,
     previewCrop: preview ? preview.crop : null,
     raw,
