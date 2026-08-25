@@ -5,6 +5,7 @@ const vm = require('node:vm');
 
 const projectRoot = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(projectRoot, 'code.js'), 'utf8');
+const uiSource = fs.readFileSync(path.join(projectRoot, 'ui.html'), 'utf8');
 const mixed = Symbol('figma.mixed');
 
 // Stand-ins for the async variable/style APIs, so the token names the plugin
@@ -50,6 +51,14 @@ const context = {
     base64Encode() {
       return 'BASE64_DATA';
     },
+    getImageByHash(hash) {
+      if (hash !== 'image:background') return null;
+      return {
+        async getBytesAsync() {
+          return new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]);
+        },
+      };
+    },
     currentPage: { selection: [] },
     ui: { postMessage() {} },
     on() {},
@@ -94,6 +103,25 @@ const solid = (r, g, b, opacity = 1) => ({
 });
 
 async function run() {
+  // Figma's iframe commonly rejects navigator.clipboard. Copy through the
+  // synchronous execCommand path first so a rejected async attempt cannot
+  // leave stale code in the clipboard, and only bind generic copy handling to
+  // buttons that actually identify a code output.
+  assert.match(
+    uiSource,
+    /function copyText\(text\) \{[\s\S]*?return copyViaExecCommand\(text\)\.catch\([\s\S]*?navigator\.clipboard\.writeText\(text\)/
+  );
+  assert.match(uiSource, /querySelectorAll\('\.copy-btn\[data-copy\]'\)/);
+  assert.match(
+    uiSource,
+    /cssFromGeneratedHtml\(htmlCode\) \|\|[\s\S]*?formatCss\(source\.css\)/
+  );
+  assert.match(uiSource, /id="exclude-base64-toggle"/);
+  assert.match(
+    uiSource,
+    /excludeBase64[\s\S]*?rewriteHtmlWithAssetPaths\(source\.html, payload\.htmlAssets \|\| \[\]\)[\s\S]*?rewriteDartWithAssetPaths\(source\.dart, payload\.dartAssets \|\| \[\]\)/
+  );
+
   const selectedIndicator = {
     id: 'ellipse:selected',
     type: 'ELLIPSE',
@@ -443,6 +471,37 @@ async function run() {
   assert.equal(assetHtml.assets[0].mimeType, 'image/svg+xml');
   assert.equal(assetHtml.assets[0].dataUri, 'data:image/svg+xml;base64,BASE64_DATA');
   assert.match(assetHtml.html, /url\("data:image\/svg\+xml;base64,BASE64_DATA"\)/);
+
+  // An image fill on a container is its background, not permission to flatten
+  // every editable child into the same PNG. Use the original fill bytes and
+  // continue generating the subtree for both HTML and Flutter.
+  const imageFillContainer = {
+    id: 'frame:image-background',
+    type: 'FRAME',
+    name: 'Image Background',
+    width: 320,
+    height: 200,
+    opacity: 1,
+    visible: true,
+    layoutMode: 'VERTICAL',
+    fills: [{ type: 'IMAGE', visible: true, opacity: 1, imageHash: 'image:background', scaleMode: 'FILL' }],
+    strokes: [],
+    effects: [],
+    children: [italicText],
+    async exportAsync() {
+      throw new Error('container must not be flattened');
+    },
+  };
+  const imageFillHtml = await api.generateHtml(imageFillContainer);
+  assert.match(imageFillHtml.html, /<div class="image-background">[\s\S]*?<p class="italic-label">/);
+  assert.match(imageFillHtml.html, /background-image: url\("data:image\/gif;base64,BASE64_DATA"\)/);
+  assert.equal(imageFillHtml.warnings.some((warning) => warning.includes('child layer(s) are baked')), false);
+
+  const imageFillDart = await api.generateDart(imageFillContainer, { withResponsive: true });
+  assert.match(imageFillDart.dart, /DecorationImage\(image: MemoryImage\(base64Decode\('BASE64_DATA'\)\)/);
+  assert.match(imageFillDart.dart, /Text\([\s\S]*?'Italic'/);
+  assert.equal(imageFillDart.assets[0].fillOnly, true);
+  assert.equal(imageFillDart.assets[0].filename, 'image-background-background.gif');
 
   // An exported child may paint far outside its logical frame (the real
   // trimming selector does this: a 150.55px frame owns a 317px boolean path

@@ -1385,7 +1385,7 @@ function getSolidFill(node) {
   const notes = [];
   if (visible.length > 1) notes.push(`${visible.length} fills stacked, composited as a flat approximation`);
   if (sawGradient) notes.push('gradient fill(s) approximated as a flat average color');
-  if (sawImage) notes.push('image/pattern fill has no CSS equivalent — the node is exported as a flattened image instead');
+  if (sawImage) notes.push('image/pattern fill requires an exported image asset');
   if (sawUnknown) notes.push('unsupported fill type present, excluded from the approximation');
   const warning = notes.length ? `"${node.name}": ${notes.join('; ')}` : undefined;
 
@@ -2203,6 +2203,14 @@ async function collectFlutterAssets(node, assets) {
     styledTextNeedsRaster
   ) {
     try {
+      if (needsRasterFill(node) && !rotatedContainer && node.children && node.children.some(isRenderable)) {
+        const fillAsset = await directImageFillAsset(node);
+        if (fillAsset) {
+          assets.set(node.id, fillAsset);
+          for (const child of node.children) await collectFlutterAssets(child, assets);
+          return;
+        }
+      }
       const bytes = await node.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 2 } });
       // Render geometry is captured alongside the bytes so both the inline
       // Image.memory and downloaded Image.asset paths reproduce the same
@@ -2312,13 +2320,14 @@ function generateDartForNode(node, indent, assets, options) {
   const pad = '  '.repeat(indent);
   const name = sanitizeVarName(node.name);
   const asset = assets && assets.get(node.id);
+  const flattenedAsset = asset && !asset.fillOnly;
   const responsive = !!(options && options.responsive);
   const parent = responsive ? options.parent || null : null;
 
   let inner;
   const visibleChildren = (node.children || []).filter(isRenderable);
 
-  if (asset) {
+  if (flattenedAsset) {
     const image = `Image.memory(base64Decode('${asset.base64}'), width: ${asset.width}, height: ${asset.height}, fit: BoxFit.fill, gaplessPlayback: true)`;
     if (asset.differsFromNodeBounds) {
       inner = `Stack(\n${pad}  clipBehavior: Clip.none,\n${pad}  children: [\n${pad}    Positioned(\n${pad}      left: ${asset.offsetX},\n${pad}      top: ${asset.offsetY},\n${pad}      child: ${image},\n${pad}    ),\n${pad}  ],\n${pad})`;
@@ -2409,7 +2418,7 @@ function generateDartForNode(node, indent, assets, options) {
   }
 
   const decoParts = [];
-  if (node.type !== 'TEXT' && !asset) {
+  if (node.type !== 'TEXT' && !flattenedAsset) {
     const color = getSolidFillDart(node);
     const gradient = getDartGradient(node);
     if (gradient) decoParts.push(`gradient: ${gradient}`);
@@ -2418,13 +2427,18 @@ function generateDartForNode(node, indent, assets, options) {
     if (border) decoParts.push(`border: ${border}`);
     const shadows = getDartBoxShadows(node);
     if (shadows) decoParts.push(`boxShadow: ${shadows}`);
+    if (asset && asset.fillOnly) {
+      decoParts.push(
+        `image: DecorationImage(image: MemoryImage(base64Decode('${asset.base64}')), fit: ${asset.flutterFit})`
+      );
+    }
   }
-  const borderRadius = !asset ? getDartBorderRadius(node) : null;
+  const borderRadius = !flattenedAsset ? getDartBorderRadius(node) : null;
   if (borderRadius) decoParts.push(`borderRadius: ${borderRadius}`);
   const decoCode = decoParts.length > 0 ? `\n${pad}  decoration: BoxDecoration(${decoParts.join(', ')}),` : '';
 
   let paddingCode = '';
-  if (!asset && node.layoutMode && node.layoutMode !== 'NONE') {
+  if (!flattenedAsset && node.layoutMode && node.layoutMode !== 'NONE') {
     const pt = node.paddingTop || 0;
     const pr = node.paddingRight || 0;
     const pb = node.paddingBottom || 0;
@@ -2438,7 +2452,7 @@ function generateDartForNode(node, indent, assets, options) {
   // their exact rasterized size, fluid or not).
   let omitWidth = false;
   let omitHeight = false;
-  if (responsive && !asset) {
+  if (responsive && !flattenedAsset) {
     if (!parent) {
       // Root: an explicit width here would make the wrapping ConstrainedBox
       // in generateDart a no-op, since Container's own width wins over an
@@ -2652,6 +2666,57 @@ function needsRasterFill(node) {
   return node.fills.some((f) => f.visible !== false && (f.type === 'IMAGE' || f.type === 'PATTERN'));
 }
 
+function imageMimeType(bytes) {
+  if (bytes && bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50) return 'image/png';
+  if (bytes && bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg';
+  if (bytes && bytes.length >= 6) {
+    const signature = String.fromCharCode(...bytes.slice(0, 6));
+    if (signature === 'GIF87a' || signature === 'GIF89a') return 'image/gif';
+  }
+  if (bytes && bytes.length >= 12) {
+    const riff = String.fromCharCode(...bytes.slice(0, 4));
+    const webp = String.fromCharCode(...bytes.slice(8, 12));
+    if (riff === 'RIFF' && webp === 'WEBP') return 'image/webp';
+  }
+  return 'image/png';
+}
+
+// An IMAGE fill belongs behind a container's children. Exporting the whole
+// container would bake those children into one PNG, so use the original image
+// bytes when the fill is unambiguous and keep walking the editable subtree.
+async function directImageFillAsset(node) {
+  if (!node.fills || node.fills === figma.mixed || typeof figma.getImageByHash !== 'function') return null;
+  const visible = node.fills.filter((fill) => fill.visible !== false);
+  if (visible.length !== 1 || visible[0].type !== 'IMAGE' || !visible[0].imageHash) return null;
+  try {
+    const image = figma.getImageByHash(visible[0].imageHash);
+    if (!image || typeof image.getBytesAsync !== 'function') return null;
+    const bytes = await image.getBytesAsync();
+    const mimeType = imageMimeType(bytes);
+    const ext = mimeType === 'image/jpeg' ? 'jpg' : mimeType.slice('image/'.length);
+    const base64 = figma.base64Encode(bytes);
+    const scaleMode = visible[0].scaleMode || 'FILL';
+    return {
+      fillOnly: true,
+      dataUri: `data:${mimeType};base64,${base64}`,
+      base64,
+      mimeType,
+      ext,
+      nodeName: `${node.name}-background`,
+      width: round(node.width),
+      height: round(node.height),
+      offsetX: 0,
+      offsetY: 0,
+      differsFromNodeBounds: false,
+      backgroundSize: scaleMode === 'FIT' ? 'contain' : scaleMode === 'TILE' ? 'auto' : 'cover',
+      backgroundRepeat: scaleMode === 'TILE' ? 'repeat' : 'no-repeat',
+      flutterFit: scaleMode === 'FIT' ? 'BoxFit.contain' : scaleMode === 'TILE' ? 'BoxFit.none' : 'BoxFit.cover',
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
 // Walks the tree once, exporting anything that needs a real rasterized/vector
 // asset (icons made of vector paths, image fills) and stashing it as a data:
 // URI keyed by node id, so the whole HTML file stays self-contained — no
@@ -2691,6 +2756,14 @@ async function collectAssets(node, assets) {
 
   if (needsRasterFill(node) || rotatedContainer) {
     try {
+      if (!rotatedContainer && node.children && node.children.some(isRenderable)) {
+        const fillAsset = await directImageFillAsset(node);
+        if (fillAsset) {
+          assets.set(node.id, fillAsset);
+          for (const child of node.children) await collectAssets(child, assets);
+          return;
+        }
+      }
       const bytes = await node.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 2 } });
       const base64 = figma.base64Encode(bytes);
       const geometry = assetRenderGeometry(node);
@@ -2725,9 +2798,10 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
   const responsive = !!(options && options.responsive);
   const parent = responsive ? options.parent || null : null;
   const asset = assets.get(node.id);
+  const flattenedAsset = asset && !asset.fillOnly;
   let assetVisualRule = null;
 
-  if (responsive && !asset) {
+  if (responsive && !flattenedAsset) {
     if (!parent) applyRootFluidCss(css, node);
   }
 
@@ -2738,7 +2812,7 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
     css.position = 'absolute';
     css.left = `${round(posOverride.left)}px`;
     css.top = `${round(posOverride.top)}px`;
-    if (responsive && !asset) applyFluidConstraintCss(css, node, parent, posOverride);
+    if (responsive && !flattenedAsset) applyFluidConstraintCss(css, node, parent, posOverride);
   }
 
   if (flexChild) {
@@ -2748,7 +2822,7 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
     css['flex-shrink'] = '0';
     if (node.layoutGrow === 1) css['flex-grow'] = '1';
     if (node.layoutAlign === 'STRETCH') css['align-self'] = 'stretch';
-    if (responsive && !asset && parent) applyFluidFlexSizing(css, node, parent);
+    if (responsive && !flattenedAsset && parent) applyFluidFlexSizing(css, node, parent);
   }
 
   if (gridChild) {
@@ -2766,10 +2840,10 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
     const verticalAlign = GRID_ITEM_ALIGN_CSS[node.gridChildVerticalAlign];
     if (horizontalAlign) css['justify-self'] = horizontalAlign;
     if (verticalAlign) css['align-self'] = verticalAlign;
-    if (responsive && !asset) applyFluidGridSizing(css, node);
+    if (responsive && !flattenedAsset) applyFluidGridSizing(css, node);
   }
 
-  if (asset) {
+  if (flattenedAsset) {
     if (node.rotation) {
       // Figma's export renders the node as it appears, rotation already baked
       // in, sized to its rotated bounding box. Keeping the CSS rotate here
@@ -2839,6 +2913,13 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
     }
   }
 
+  if (asset && asset.fillOnly) {
+    css['background-image'] = `url("${asset.dataUri}")`;
+    css['background-size'] = asset.backgroundSize;
+    css['background-repeat'] = asset.backgroundRepeat;
+    css['background-position'] = 'center';
+  }
+
   const isAutoLayout = !!(node.layoutMode && node.layoutMode !== 'NONE');
   const visibleChildren = (node.children || []).filter(isRenderable);
   const hasChildren = visibleChildren.length > 0;
@@ -2848,7 +2929,7 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
   // of otherwise-flowing siblings rely on this constantly.
   const anyChildNeedsAbsolute =
     hasChildren && visibleChildren.some((c) => !isAutoLayout || c.layoutPositioning === 'ABSOLUTE');
-  if (anyChildNeedsAbsolute && !asset) {
+  if (anyChildNeedsAbsolute && !flattenedAsset) {
     // Establishes the containing block its own absolutely-positioned children
     // anchor to. If posOverride already set position: absolute above, that
     // already serves the same purpose — don't clobber it.
@@ -2862,7 +2943,7 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
   if (assetVisualRule) rules.push(assetVisualRule);
 
   // Exported as a flattened image — don't also emit its (now-redundant) vector sub-paths.
-  if (asset) {
+  if (flattenedAsset) {
     return `${pad}<div class="${className}"></div>`;
   }
 

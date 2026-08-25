@@ -256,6 +256,14 @@
   <span class="hint" style="margin:0;">Uses Figma's own Fill/Hug/Constraints — not a guessed breakpoint.</span>
 </div>
 
+<div id="asset-mode-row" class="select-row" style="display:none;">
+  <label class="responsive-toggle">
+    <input type="checkbox" id="exclude-base64-toggle" />
+    External image paths
+  </label>
+  <span class="hint" style="margin:0;">Keeps Base64 out of copied code; download the image files before using it.</span>
+</div>
+
 <div id="debug-send-row" class="debug-send-row" style="display:none;">
   <button class="copy-btn" id="debug-connect-btn">Connect</button>
   <span id="debug-send-status" class="hint" style="margin:0;">Not connected — every selection stays local until you connect.</span>
@@ -266,6 +274,7 @@
 <div id="panels" style="display:none">
   <div class="panel active" id="panel-css">
     <div class="node-name" id="css-node-name"></div>
+    <div class="hint">Full node tree — one CSS rule per generated parent and child element.</div>
     <div id="css-warnings"></div>
     <pre class="code-block" id="css-output"></pre>
     <button class="copy-btn" data-copy="css-output">Copy CSS</button>
@@ -371,13 +380,15 @@
 
   function copyText(text) {
     // Figma's plugin UI iframe doesn't grant the clipboard-write permission
-    // navigator.clipboard needs, so it silently rejects there. execCommand
-    // still works inside that sandbox, so try clipboard API first and fall
-    // back to it rather than failing silently.
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      return navigator.clipboard.writeText(text).catch(() => copyViaExecCommand(text));
-    }
-    return copyViaExecCommand(text);
+    // navigator.clipboard needs. The fallback must run synchronously during the
+    // click gesture; trying the async API first can leave the old clipboard in
+    // place by the time its rejection arrives.
+    return copyViaExecCommand(text).catch(() => {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(text);
+      }
+      throw new Error('Clipboard access is unavailable');
+    });
   }
 
   function copyViaExecCommand(text) {
@@ -400,7 +411,7 @@
     });
   }
 
-  document.querySelectorAll('.copy-btn').forEach((btn) => {
+  document.querySelectorAll('.copy-btn[data-copy]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const target = document.getElementById(btn.dataset.copy);
       const text = target.textContent;
@@ -424,6 +435,13 @@
       .join('\n');
   }
 
+  function cssFromGeneratedHtml(html) {
+    const open = html.lastIndexOf('\n<style>\n');
+    const close = html.lastIndexOf('\n</style>');
+    if (open === -1 || close <= open) return null;
+    return html.slice(open + '\n<style>\n'.length, close);
+  }
+
   function render(message) {
     currentSelection = message;
     activeIndex = 0;
@@ -431,6 +449,7 @@
     document.getElementById('panels').style.display = 'block';
     document.getElementById('debug-send-row').style.display = 'flex';
     document.getElementById('responsive-row').style.display = 'flex';
+    document.getElementById('asset-mode-row').style.display = 'flex';
     if (debugConnected) sendDebugPayload(message);
 
     renderSelectionPicker(message);
@@ -477,10 +496,22 @@
     renderActiveNode();
   });
 
+  let excludeBase64 = false;
+  document.getElementById('exclude-base64-toggle').addEventListener('change', (event) => {
+    excludeBase64 = event.target.checked;
+    renderActiveNode();
+  });
+
   function renderActiveNode() {
     const payload = activePayload();
     if (!payload) return;
     const source = responsiveMode && payload.responsive ? payload.responsive : payload;
+    const htmlCode = excludeBase64
+      ? rewriteHtmlWithAssetPaths(source.html, payload.htmlAssets || [])
+      : source.html;
+    const dartCode = excludeBase64
+      ? rewriteDartWithAssetPaths(source.dart, payload.dartAssets || [])
+      : source.dart;
 
     document.getElementById('css-node-name').textContent = payload.nodeName;
     document.getElementById('flutter-node-name').textContent = payload.nodeName;
@@ -503,9 +534,10 @@
     });
 
     document.getElementById('css-output').textContent =
+      cssFromGeneratedHtml(htmlCode) ||
       '.' + safeSelector(payload.nodeName) + ' {\n' + formatCss(source.css) + '\n}';
-    document.getElementById('flutter-output').textContent = source.dart;
-    document.getElementById('html-output').textContent = source.html;
+    document.getElementById('flutter-output').textContent = dartCode;
+    document.getElementById('html-output').textContent = htmlCode;
 
     renderAssetControls(payload);
   }
@@ -572,12 +604,21 @@
   function rewriteDartWithAssetPaths(dart, assetsManifest) {
     let result = dart;
     assetsManifest.forEach((asset) => {
+      if (asset.fillOnly) {
+        const oldProvider = `MemoryImage(base64Decode('${asset.base64}'))`;
+        const newProvider = `AssetImage('assets/${asset.filename}')`;
+        result = result.split(oldProvider).join(newProvider);
+        return;
+      }
       const oldCall =
         `Image.memory(base64Decode('${asset.base64}'), width: ${asset.width}, height: ${asset.height}, ` +
         'fit: BoxFit.fill, gaplessPlayback: true)';
       const newCall = `Image.asset('assets/${asset.filename}', width: ${asset.width}, height: ${asset.height}, fit: BoxFit.fill)`;
       result = result.split(oldCall).join(newCall);
     });
+    if (!result.includes('base64Decode(')) {
+      result = result.replace("import 'dart:convert';\n", '');
+    }
     return result;
   }
 
@@ -907,6 +948,7 @@
     document.getElementById('debug-send-row').style.display = 'none';
     document.getElementById('selection-row').style.display = 'none';
     document.getElementById('responsive-row').style.display = 'none';
+    document.getElementById('asset-mode-row').style.display = 'none';
   }
 
   // Once connected, every new selection (render() call) gets pushed to the
