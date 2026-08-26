@@ -1,7 +1,8 @@
 {
   "name": "FigmaToCode",
-  "id": "css-inspector-local",
+  "id": "1674341622595555113",
   "api": "1.0.0",
+  "documentAccess": "dynamic-page",
   "main": "code.js",
   "ui": "ui.html",
   "editorType": ["figma"],
