@@ -235,6 +235,7 @@
   <button class="tab" data-tab="html">HTML</button>
   <button class="tab" data-tab="design">Design System</button>
   <button class="tab" data-tab="preview">Preview</button>
+  <button class="tab" data-tab="prototype">Prototype</button>
 </div>
 
 <!-- Only shown for a multi-selection: CSS/Flutter/HTML/Preview are per-layer, so
@@ -262,6 +263,18 @@
     External image paths
   </label>
   <span class="hint" style="margin:0;">Keeps Base64 out of copied code; download the image files before using it.</span>
+</div>
+
+<!-- Fixed-geometry-only opt-in — see inlineSvgHtml in code.js. Ignored while
+     Responsive is on, since that variant was never computed for it. -->
+<div id="inline-svg-row" class="select-row" style="display:none;">
+  <label class="responsive-toggle">
+    <input type="checkbox" id="inline-svg-toggle" />
+    Inline SVG icons
+  </label>
+  <span class="hint" style="margin:0;">
+    Flattened vector icons become real, inspectable &lt;svg&gt; markup instead of a background image.
+  </span>
 </div>
 
 <div id="debug-send-row" class="debug-send-row" style="display:none;">
@@ -355,6 +368,23 @@
     <div id="preview-iframe-wrap" class="preview-iframe-wrap">
       <div id="preview-render-host" class="preview-render-host"></div>
     </div>
+  </div>
+
+  <div class="panel" id="panel-prototype">
+    <div class="node-name">Prototype</div>
+    <div class="hint">
+      Bundles every top-level frame in the current selection into one clickable HTML file — Navigate/Overlay
+      reactions become real click/hover behavior, and Smart Animate transitions tween matching layers by name.
+    </div>
+    <div id="prototype-empty" class="hint">Select 2 or more frames to build a prototype.</div>
+    <div id="prototype-warnings"></div>
+    <div id="prototype-iframe-wrap" class="preview-iframe-wrap" style="display:none;">
+      <div id="prototype-render-host" class="preview-render-host"></div>
+    </div>
+    <pre class="code-block" id="prototype-output" style="display:none;"></pre>
+    <button class="copy-btn" data-copy="prototype-output" id="prototype-copy-btn" style="display:none;">
+      Copy HTML
+    </button>
   </div>
 </div>
 
@@ -450,11 +480,66 @@
     document.getElementById('debug-send-row').style.display = 'flex';
     document.getElementById('responsive-row').style.display = 'flex';
     document.getElementById('asset-mode-row').style.display = 'flex';
+    document.getElementById('inline-svg-row').style.display = 'flex';
     if (debugConnected) sendDebugPayload(message);
 
     renderSelectionPicker(message);
     renderDesignSystem(message.designSystem);
     renderActiveNode();
+    renderPrototype(message);
+  }
+
+  // Whole-selection level, like the Design System tab — not per-layer like
+  // CSS/Flutter/HTML/Preview, since the bundle only exists once ≥2 top-level
+  // frames are selected together (see generatePrototypeBundle in code.js).
+  function renderPrototype(message) {
+    const empty = document.getElementById('prototype-empty');
+    const wrap = document.getElementById('prototype-iframe-wrap');
+    const output = document.getElementById('prototype-output');
+    const copyBtn = document.getElementById('prototype-copy-btn');
+    const warningsEl = document.getElementById('prototype-warnings');
+    const bundle = message.prototype;
+
+    warningsEl.innerHTML = '';
+    if (!bundle) {
+      empty.style.display = 'block';
+      wrap.style.display = 'none';
+      output.style.display = 'none';
+      copyBtn.style.display = 'none';
+      return;
+    }
+
+    empty.style.display = 'none';
+    wrap.style.display = 'block';
+    output.style.display = 'block';
+    copyBtn.style.display = 'inline-block';
+    output.textContent = bundle.html;
+    (bundle.warnings || []).forEach((w) => {
+      const div = document.createElement('div');
+      div.className = 'warning';
+      div.textContent = w;
+      warningsEl.appendChild(div);
+    });
+
+    // Same CSP constraint as renderPreview: nested <iframe> is blocked, so this
+    // renders into a shadow root instead. Unlike renderPreview's static markup,
+    // this bundle ships a <script> for click/hover navigation — script elements
+    // set via innerHTML are inert, so each one is recreated to actually run.
+    const host = document.getElementById('prototype-render-host');
+    if (!host.shadowRoot) host.attachShadow({ mode: 'open' });
+    host.shadowRoot.innerHTML = bundle.html;
+    // The bundled script queries `window.__figmaPrototypeRoot` instead of the
+    // global `document` — from inside a shadow root, document.querySelectorAll
+    // can't see these elements at all, so every listener would silently attach
+    // to nothing. Set it right before each script (re-)runs synchronously;
+    // it's read into a closure variable immediately, so clearing it after is safe.
+    window.__figmaPrototypeRoot = host.shadowRoot;
+    host.shadowRoot.querySelectorAll('script').forEach((oldScript) => {
+      const newScript = document.createElement('script');
+      newScript.textContent = oldScript.textContent;
+      oldScript.replaceWith(newScript);
+    });
+    delete window.__figmaPrototypeRoot;
   }
 
   function renderSelectionPicker(message) {
@@ -502,10 +587,20 @@
     renderActiveNode();
   });
 
+  // Fixed-geometry-only opt-in (see inlineSvgHtml in code.js) — no variant was
+  // ever computed for the fluid/responsive geometry, so this is simply
+  // ignored while Responsive is checked rather than showing nothing.
+  let inlineSvgMode = false;
+  document.getElementById('inline-svg-toggle').addEventListener('change', (event) => {
+    inlineSvgMode = event.target.checked;
+    renderActiveNode();
+  });
+
   function renderActiveNode() {
     const payload = activePayload();
     if (!payload) return;
-    const source = responsiveMode && payload.responsive ? payload.responsive : payload;
+    const source = { ...(responsiveMode && payload.responsive ? payload.responsive : payload) };
+    if (inlineSvgMode && !responsiveMode && payload.inlineSvgHtml) source.html = payload.inlineSvgHtml;
     const htmlCode = excludeBase64
       ? rewriteHtmlWithAssetPaths(source.html, payload.htmlAssets || [])
       : source.html;
@@ -940,15 +1035,26 @@
     return base;
   }
 
-  function showEmpty() {
+  // `message` is only ever passed for the 'error' case below — every other
+  // caller keeps today's plain "select something" copy. Previously any
+  // exception anywhere in buildSelectionPayload (a bug in the newest,
+  // least-tested code as much as an old one) surfaced as this same blank
+  // state with zero indication of what broke or why — showing the real
+  // message here doesn't change the (already-broken) behavior for anything
+  // that already worked, it just stops it from being silent.
+  function showEmpty(message) {
     currentSelection = null;
     activeIndex = 0;
+    document.getElementById('empty-state').textContent =
+      message || 'Select an element on the canvas to inspect it.';
     document.getElementById('empty-state').style.display = 'block';
     document.getElementById('panels').style.display = 'none';
     document.getElementById('debug-send-row').style.display = 'none';
     document.getElementById('selection-row').style.display = 'none';
     document.getElementById('responsive-row').style.display = 'none';
     document.getElementById('asset-mode-row').style.display = 'none';
+    document.getElementById('inline-svg-row').style.display = 'none';
+    renderPrototype({ prototype: null });
   }
 
   // Once connected, every new selection (render() call) gets pushed to the
@@ -999,7 +1105,7 @@
     } else if (msg.type === 'selection') {
       render(msg);
     } else if (msg.type === 'error') {
-      showEmpty();
+      showEmpty('Something went wrong building this selection: ' + msg.message);
     }
   };
 
