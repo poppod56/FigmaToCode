@@ -73,6 +73,82 @@ python3 .debug-server/debug-server.py
 
 Dumps land in `.debug-server/data/latest.json` / `latest.png` (git-ignored).
 
+### Local MCP server
+
+Settings → **MCP Connect** runs a local [MCP](https://modelcontextprotocol.io)
+server so an AI client (e.g. Claude Desktop) can pull whatever it needs from
+the current Figma selection — generated CSS/HTML/Dart, design tokens, the
+clickable prototype bundle, and real image/preview files written straight to
+disk (not left as inline base64). It stays off by default and everything
+stays on your own machine.
+
+1. **Get the script** — either use `.mcp-server/mcp_server.py` from this repo,
+   or, if you only installed the plugin from Community (no repo checkout),
+   copy/download it straight from the plugin's Settings → MCP Connect panel.
+2. **Create a virtual environment next to the script and install into it**
+   (plain `pip install` fails on modern macOS/Homebrew Python with an
+   "externally-managed-environment" error — a venv sidesteps that, and keeps
+   these two packages out of your system Python entirely):
+
+   ```
+   cd .mcp-server
+   python3 -m venv venv
+   source venv/bin/activate   # Windows: venv\Scripts\activate
+   python3 -m ensurepip --upgrade   # skip if `pip --version` already works
+   pip install mcp websockets
+   ```
+
+   That `ensurepip` line is only needed if `pip install` above errors with
+   `command not found: pip` — some Python builds don't bootstrap pip into a
+   new venv automatically. If `ensurepip` itself then fails too (some
+   Homebrew Python builds strip pip's bundled installer wheel to shrink the
+   bottle), fall back to fetching the real installer instead:
+
+   ```
+   curl -sS https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+   python3 get-pip.py
+   pip install mcp websockets
+   ```
+
+   Then, each time you want the server running:
+
+   ```
+   source venv/bin/activate
+   python3 mcp_server.py
+   ```
+
+   Leave that process running — it holds the live bridge to the plugin and
+   answers the MCP client's tool calls.
+3. **In Figma**, open the plugin, select something, and toggle
+   Settings → MCP Connect → **Connect**. Every new selection streams to the
+   server automatically from then on.
+4. **Point your MCP client at the script over stdio.** MCP clients spawn the
+   process themselves — they don't inherit an activated venv from your shell
+   — so `command` must point at the venv's own Python executable, not the
+   system `python3`. For Claude Desktop, add this to
+   `claude_desktop_config.json` (using the absolute paths to wherever you
+   saved the script):
+
+   ```json
+   {
+     "mcpServers": {
+       "figma-to-code": {
+         "command": "/absolute/path/to/.mcp-server/venv/bin/python3",
+         "args": ["/absolute/path/to/.mcp-server/mcp_server.py"]
+       }
+     }
+   }
+   ```
+
+   Restart Claude Desktop, and it can then call `list_selected_nodes`,
+   `get_node_code`, `export_node` (code + real asset files + preview PNG for
+   one layer), `export_selection` (the whole selection at once),
+   `get_design_tokens`/`get_design_export`, and `get_prototype_html`.
+
+Like the debug server, this needs Python 3 on your machine and is meant for
+developers/power users wiring the plugin into an AI workflow — most
+plugin users will never need it.
+
 ## Project structure
 
 ```
@@ -84,6 +160,8 @@ ui.html          Plugin UI (tabs, toggles, copy buttons) — postMessage'd
 tests/           Node-runnable regression suite (see below)
 .debug-server/   Optional local debug HTTP server (see above); generated JSON,
                  PNG captures, and logs stay git-ignored
+.mcp-server/     Optional local MCP server (see above) bridging the plugin's
+                 live selection to an MCP client like Claude Desktop
 ```
 
 ## Development
