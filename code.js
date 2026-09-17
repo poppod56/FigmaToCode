@@ -198,29 +198,45 @@ async function describeInstance(node) {
   const set = main && main.parent && main.parent.type === 'COMPONENT_SET' ? main.parent : null;
 
   let variantProperties = {};
-  const rawVariants = node.variantProperties || (main && main.variantProperties) || null;
-  if (rawVariants) {
-    Object.keys(rawVariants).forEach((key) => {
-      if (rawVariants[key] !== null && rawVariants[key] !== undefined) {
-        variantProperties[key] = String(rawVariants[key]);
-      }
-    });
-  } else if (main && set) {
-    variantProperties = parseVariantName(main.name);
+  try {
+    // Figma itself throws reading `.variantProperties` ("Component set for
+    // node has existing errors") when the backing component set has an
+    // editor-side validation error (e.g. a duplicate variant combination) —
+    // unrelated to anything this plugin controls. Fall back to parsing the
+    // visible name instead of failing the whole selection over it.
+    const rawVariants = node.variantProperties || (main && main.variantProperties) || null;
+    if (rawVariants) {
+      Object.keys(rawVariants).forEach((key) => {
+        if (rawVariants[key] !== null && rawVariants[key] !== undefined) {
+          variantProperties[key] = String(rawVariants[key]);
+        }
+      });
+    } else if (main && set) {
+      variantProperties = parseVariantName(main.name);
+    }
+  } catch (e) {
+    variantProperties = main ? parseVariantName(main.name) : {};
   }
 
   const properties = {};
-  if (node.componentProperties) {
-    Object.keys(node.componentProperties).forEach((key) => {
-      const prop = node.componentProperties[key];
-      if (!prop) return;
-      // Figma suffixes property keys with a unique id ("Label#123:0") — the part
-      // before the "#" is the name the designer sees.
-      properties[key.split('#')[0]] = {
-        type: prop.type,
-        value: prop.type === 'INSTANCE_SWAP' ? String(prop.value) : prop.value,
-      };
-    });
+  try {
+    // Same Figma-side quirk as the variantProperties read above — throws for
+    // an instance of a component set that already has an editor-side error,
+    // regardless of what this plugin does.
+    if (node.componentProperties) {
+      Object.keys(node.componentProperties).forEach((key) => {
+        const prop = node.componentProperties[key];
+        if (!prop) return;
+        // Figma suffixes property keys with a unique id ("Label#123:0") — the
+        // part before the "#" is the name the designer sees.
+        properties[key.split('#')[0]] = {
+          type: prop.type,
+          value: prop.type === 'INSTANCE_SWAP' ? String(prop.value) : prop.value,
+        };
+      });
+    }
+  } catch (e) {
+    // leave `properties` empty — better than losing the whole selection over it
   }
 
   const componentName = set ? set.name : main ? main.name : node.name;
@@ -2681,6 +2697,45 @@ function imageMimeType(bytes) {
   return 'image/png';
 }
 
+// Figma's plugin sandbox can't be assumed to expose a global TextDecoder (the
+// test harness's bare vm context confirmably doesn't), so decode the SVG
+// export's UTF-8 bytes by hand rather than depend on a host API.
+function utf8BytesToString(bytes) {
+  let result = '';
+  let i = 0;
+  while (i < bytes.length) {
+    const byte1 = bytes[i++];
+    if (byte1 < 0x80) {
+      result += String.fromCharCode(byte1);
+    } else if (byte1 >= 0xc0 && byte1 < 0xe0 && i < bytes.length) {
+      const byte2 = bytes[i++];
+      result += String.fromCharCode(((byte1 & 0x1f) << 6) | (byte2 & 0x3f));
+    } else if (byte1 >= 0xe0 && byte1 < 0xf0 && i + 1 < bytes.length) {
+      const byte2 = bytes[i++];
+      const byte3 = bytes[i++];
+      result += String.fromCharCode(((byte1 & 0x0f) << 12) | ((byte2 & 0x3f) << 6) | (byte3 & 0x3f));
+    } else if (byte1 >= 0xf0 && i + 2 < bytes.length) {
+      const byte2 = bytes[i++];
+      const byte3 = bytes[i++];
+      const byte4 = bytes[i++];
+      const codepoint =
+        ((byte1 & 0x07) << 18) | ((byte2 & 0x3f) << 12) | ((byte3 & 0x3f) << 6) | (byte4 & 0x3f);
+      const surrogate = codepoint - 0x10000;
+      result += String.fromCharCode(0xd800 + (surrogate >> 10), 0xdc00 + (surrogate & 0x3ff));
+    } else {
+      result += String.fromCharCode(byte1); // malformed byte — best-effort passthrough
+    }
+  }
+  return result;
+}
+
+// Forces the exported SVG to fill whatever box the wrapping element already
+// has (from extractCss), rather than trusting its own width/height/viewBox
+// attributes to line up with that box exactly.
+function sizeInlineSvg(svgMarkup) {
+  return svgMarkup.replace(/<svg(\s|>)/, '<svg style="width:100%;height:100%;display:block"$1');
+}
+
 // An IMAGE fill belongs behind a container's children. Exporting the whole
 // container would bake those children into one PNG, so use the original image
 // bytes when the fill is unambiguous and keep walking the editable subtree.
@@ -2741,6 +2796,11 @@ async function collectAssets(node, assets) {
         mimeType: 'image/svg+xml',
         ext: 'svg',
         nodeName: node.name,
+        // Only ever read by the opt-in inline-SVG mode (see generateHtmlTree's
+        // `options.inlineSvg`) — decoded eagerly here since the bytes are
+        // already in hand, but it changes nothing for the default background-
+        // image path, which only reads `dataUri`/`base64`.
+        svgMarkup: utf8BytesToString(bytes),
         ...geometry,
       });
     } catch (e) {
@@ -2787,6 +2847,77 @@ async function collectAssets(node, assets) {
   }
 }
 
+// ---------- Prototype export: reactions ----------
+// Figma's prototyping data (triggers/actions/transitions). Reading it here is
+// orthogonal to the fixed-pixel converter above — nothing in extractCss or
+// generateHtmlTree's default path touches `.reactions`, so this can't change
+// today's output. It only feeds generatePrototypeBundle, which opts in
+// explicitly via options.reactionMap.
+function escapeAttr(text) {
+  return escapeHtml(text).replace(/"/g, '&quot;');
+}
+
+function normalizeReactionAction(trigger, action) {
+  if (!action) return null;
+  const transition = action.transition || null;
+  return {
+    trigger: (trigger && trigger.type) || 'ON_CLICK',
+    actionType: action.type || null,
+    navigation: action.navigation || null,
+    destinationId: action.destinationId || null,
+    url: action.url || null,
+    transitionType: transition ? transition.type : null,
+    // Figma reports duration in seconds; the bundled <script> wants ms.
+    transitionDuration:
+      transition && typeof transition.duration === 'number' ? Math.round(transition.duration * 1000) : null,
+    transitionEasing: transition && transition.easing ? transition.easing.type : null,
+  };
+}
+
+function extractReactions(node) {
+  if (!node.reactions || node.reactions.length === 0) return [];
+  const out = [];
+  node.reactions.forEach((reaction) => {
+    // Older API shape: `reaction.action` (singular). Newer: `reaction.actions`
+    // (array). Handle both so this doesn't silently go blind on either version.
+    const actions = reaction.actions || (reaction.action ? [reaction.action] : []);
+    actions.forEach((action) => {
+      const normalized = normalizeReactionAction(reaction.trigger, action);
+      if (normalized) out.push(normalized);
+    });
+  });
+  return out;
+}
+
+function collectReactionsForTree(root, map) {
+  const result = map || new Map();
+  const reactions = extractReactions(root);
+  if (reactions.length > 0) result.set(root.id, reactions);
+  if (root.children) {
+    root.children.forEach((child) => collectReactionsForTree(child, result));
+  }
+  return result;
+}
+
+// A node can carry several reactions (one per trigger). Only the first one
+// with a destination drives the exported bundle's click/hover wiring — this
+// export targets navigate/hover/overlay, not arbitrary reaction stacking.
+function reactionAttrsHtml(reactions) {
+  if (!reactions || reactions.length === 0) return '';
+  const primary = reactions.find((r) => r.destinationId) || null;
+  if (!primary) return '';
+  const parts = [
+    ` data-reaction-trigger="${escapeAttr(primary.trigger)}"`,
+    ` data-reaction-target="frame-${escapeAttr(primary.destinationId)}"`,
+  ];
+  if (primary.navigation) parts.push(` data-reaction-nav="${escapeAttr(primary.navigation)}"`);
+  if (primary.transitionType) parts.push(` data-reaction-transition="${escapeAttr(primary.transitionType)}"`);
+  if (typeof primary.transitionDuration === 'number') {
+    parts.push(` data-reaction-duration="${primary.transitionDuration}"`);
+  }
+  return parts.join('');
+}
+
 function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posOverride, flexChild, gridChild, options) {
   const pad = '  '.repeat(indent);
   const className = toClassName(node.name, node.type, usedNames);
@@ -2797,9 +2928,26 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
   // the recursive call below, which is the sole place it gets threaded down.
   const responsive = !!(options && options.responsive);
   const parent = responsive ? options.parent || null : null;
+
+  // Opt-in only: unset for every existing call site (Preview/CSS/HTML/Dart
+  // tabs), so this never changes today's output. Only generatePrototypeBundle
+  // passes a reactionMap/smartKeyMap, to attach data-reaction-*/data-smart-key
+  // attributes read by the bundled <script> and Smart Animate CSS it emits.
+  const reactionMap = options && options.reactionMap ? options.reactionMap : null;
+  const nodeReactions = reactionMap ? reactionMap.get(node.id) : null;
+  const smartKeyMap = options && options.smartKeyMap ? options.smartKeyMap : null;
+  const smartKey = smartKeyMap ? smartKeyMap.get(node.id) : null;
+  const tagAttrs =
+    reactionAttrsHtml(nodeReactions) + (smartKey ? ` data-smart-key="${escapeAttr(smartKey)}"` : '');
+  // Opt-in only: unset for every existing call site, so a flattened vector
+  // asset still renders as an empty background-image <div> by default (see
+  // below). Only set when generateHtml's inline-SVG variant is being built.
+  const inlineSvg = !!(options && options.inlineSvg);
   const asset = assets.get(node.id);
   const flattenedAsset = asset && !asset.fillOnly;
   let assetVisualRule = null;
+  let inlineSvgMarkup = null;
+  let inlineSvgWrapperClass = null;
 
   if (responsive && !flattenedAsset) {
     if (!parent) applyRootFluidCss(css, node);
@@ -2872,7 +3020,29 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
       if (node.width === 0) css.width = `${round(strokeWeight)}px`;
       if (node.height === 0) css.height = `${round(strokeWeight)}px`;
     }
-    if (asset.differsFromNodeBounds) {
+    if (inlineSvg && asset.svgMarkup) {
+      // Real markup instead of a background-image data URI — inspectable,
+      // and stylable via CSS (`.className path { fill: ... }`) instead of an
+      // opaque raster. Only ever true for the vector-only-subtree branch of
+      // collectAssets (image fills/rotated containers have no svgMarkup), and
+      // only when generateHtml's inline-SVG variant explicitly asked for it.
+      if (asset.differsFromNodeBounds) {
+        css.position = css.position || 'relative';
+        delete css.overflow;
+        inlineSvgWrapperClass = `${className}-svg`;
+        rules.push(
+          `.${inlineSvgWrapperClass} {\n` +
+            `  position: absolute;\n` +
+            `  left: ${asset.offsetX}px;\n` +
+            `  top: ${asset.offsetY}px;\n` +
+            `  width: ${asset.width}px;\n` +
+            `  height: ${asset.height}px;\n` +
+            `  pointer-events: none;\n` +
+            `}`
+        );
+      }
+      inlineSvgMarkup = sizeInlineSvg(asset.svgMarkup);
+    } else if (asset.differsFromNodeBounds) {
       // Keep this element at the logical Figma size so flex/absolute layout is
       // unchanged, while a paint-only layer carries the larger exported
       // render (overflowing children, strokes, and shadows included).
@@ -2944,14 +3114,24 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
 
   // Exported as a flattened image — don't also emit its (now-redundant) vector sub-paths.
   if (flattenedAsset) {
-    return `${pad}<div class="${className}"></div>`;
+    if (inlineSvgMarkup) {
+      const inner = inlineSvgWrapperClass
+        ? `<div class="${inlineSvgWrapperClass}">${inlineSvgMarkup}</div>`
+        : inlineSvgMarkup;
+      return `${pad}<div class="${className}"${tagAttrs}>${inner}</div>`;
+    }
+    return `${pad}<div class="${className}"${tagAttrs}></div>`;
   }
 
   if (node.type === 'TEXT') {
-    return `${pad}<p class="${className}">${escapeHtml(node.characters)}</p>`;
+    return `${pad}<p class="${className}"${tagAttrs}>${escapeHtml(node.characters)}</p>`;
   }
   if (hasChildren) {
     const inset = borderInset(node);
+    const childOptions =
+      responsive || reactionMap || smartKeyMap || inlineSvg
+        ? { responsive, parent: responsive ? node : null, reactionMap, smartKeyMap, inlineSvg }
+        : undefined;
     const childrenHtml = visibleChildren
       .map((c) => {
         const childNeedsAbsolute = !isAutoLayout || c.layoutPositioning === 'ABSOLUTE';
@@ -2974,34 +3154,32 @@ function generateHtmlTree(node, usedNames, rules, warnings, indent, assets, posO
           childOverride,
           !childNeedsAbsolute && !childIsGridItem,
           childIsGridItem,
-          responsive ? { responsive: true, parent: node } : undefined
+          childOptions
         );
       })
       .join('\n');
-    return `${pad}<div class="${className}">\n${childrenHtml}\n${pad}</div>`;
+    return `${pad}<div class="${className}"${tagAttrs}>\n${childrenHtml}\n${pad}</div>`;
   }
-  return `${pad}<div class="${className}"></div>`;
+  return `${pad}<div class="${className}"${tagAttrs}></div>`;
 }
 
 // Shared by both the fixed and the fluid build below — same tree walk, same
 // asset map (exportAsync already ran once by the time this is called), only
 // the `responsive` flag differs.
-function buildHtmlDocument(node, assets, responsive) {
+function buildHtmlDocument(node, assets, responsive, reactionMap, smartKeyMap, inlineSvg) {
   const usedNames = new Set();
   const rules = [];
   const warnings = [];
-  const body = generateHtmlTree(
-    node,
-    usedNames,
-    rules,
-    warnings,
-    0,
-    assets,
-    null,
-    false,
-    false,
-    responsive ? { responsive: true } : undefined
-  );
+  const rootOptions =
+    responsive || reactionMap || smartKeyMap || inlineSvg
+      ? {
+          responsive: !!responsive,
+          reactionMap: reactionMap || null,
+          smartKeyMap: smartKeyMap || null,
+          inlineSvg: !!inlineSvg,
+        }
+      : undefined;
+  const body = generateHtmlTree(node, usedNames, rules, warnings, 0, assets, null, false, false, rootOptions);
 
   // Figma sizes include the stroke (its default stroke align is inside), and
   // <p> carries a default margin. Scope the reset to the generated root so
@@ -3019,20 +3197,314 @@ function buildHtmlDocument(node, assets, responsive) {
   };
 }
 
-async function generateHtml(node) {
+// `reactionMap`/`smartKeyMap` are only ever passed by generatePrototypeBundle
+// — every other call site omits them, so the fixed/fluid output here is
+// unchanged by default.
+async function generateHtml(node, reactionMap, smartKeyMap) {
   const assets = new Map();
   await collectAssets(node, assets);
 
-  const fixed = buildHtmlDocument(node, assets, false);
+  const fixed = buildHtmlDocument(node, assets, false, reactionMap, smartKeyMap);
   const fluid = buildHtmlDocument(node, assets, true);
+  // Same fixed-pixel geometry as `fixed`, just with flattened vector icons
+  // kept as real inline <svg> markup instead of a background-image data URI
+  // — opt-in, shown only when ui.html's "Inline SVG icons" toggle is on.
+  // Scoped to the fixed geometry only; not combined with the fluid variant.
+  const inlineSvgDoc = buildHtmlDocument(node, assets, false, reactionMap, smartKeyMap, true);
   return {
     html: fixed.html,
     warnings: fixed.warnings,
     responsiveHtml: fluid.html,
+    inlineSvgHtml: inlineSvgDoc.html,
     // Named, deduped asset files — see nameAssetFiles. The ui.html "download
     // images" action decodes these and swaps the matching data URI in the
     // html string above for a real assets/<filename> path.
     assets: nameAssetFiles(assets),
+  };
+}
+
+// ---------- Prototype export: bundling multiple frames into one clickable file ----------
+
+// Combines every selected frame's assets into a single HTML file — a
+// per-node cap calibrated for one-frame-at-a-time code generation
+// (MAX_CODE_NODES) isn't calibrated for that combined payload, so this gets
+// its own, smaller limit.
+const MAX_PROTOTYPE_FRAMES = 6;
+
+function frameSectionId(node) {
+  return `frame-${node.id}`;
+}
+
+// Vanilla JS, not generated per-node: wires up every element the reactionMap
+// attached data-reaction-* attributes to, so the exported file is clickable
+// on its own with no runtime dependency.
+const PROTOTYPE_BUNDLE_SCRIPT = `(function () {
+  // Opened as a standalone file, this script's root is \`document\` itself.
+  // Rendered live inside the plugin's own Prototype tab, ui.html copies it
+  // into a shadow root instead (same CSP workaround as the Preview tab) —
+  // querying the outer \`document\` from there finds nothing, so every
+  // listener below would silently attach to zero elements. ui.html sets
+  // window.__figmaPrototypeRoot to that shadow root immediately before
+  // (re-)running this script, specifically so it can be found here; a
+  // standalone open never sets it, so this just falls back to \`document\`.
+  var root = window.__figmaPrototypeRoot || document;
+  function showFrame(id) {
+    root.querySelectorAll('.proto-frame').forEach(function (section) {
+      if (!section.classList.contains('proto-overlay')) section.hidden = section.id !== id;
+    });
+  }
+  function applyTransition(el, type, durationMs) {
+    if (!durationMs) return;
+    if (type === 'MOVE_IN' || type === 'MOVE_OUT' || type === 'SLIDE_IN' || type === 'SLIDE_OUT' || type === 'PUSH') {
+      el.style.transition = 'transform ' + durationMs + 'ms ease, opacity ' + durationMs + 'ms ease';
+    } else {
+      el.style.transition = 'opacity ' + durationMs + 'ms ease';
+    }
+  }
+  // Smart Animate: instead of an instant cut, add a "smart-to-<dest>" class to
+  // the *source* section first — the CSS diffFramesForSmartAnimate emitted
+  // reacts to that class and tweens the matched elements — then cut over to
+  // the destination section once the transition has had time to finish.
+  function handleReaction(el) {
+    var targetId = el.getAttribute('data-reaction-target');
+    if (!targetId) return;
+    var target = root.getElementById(targetId);
+    if (!target) return;
+    var nav = el.getAttribute('data-reaction-nav');
+    var transitionType = el.getAttribute('data-reaction-transition');
+    var duration = parseInt(el.getAttribute('data-reaction-duration') || '0', 10);
+    var cutOver = function () {
+      if (nav === 'OVERLAY') {
+        target.classList.add('proto-overlay');
+        target.hidden = false;
+      } else {
+        showFrame(targetId);
+      }
+    };
+    if (transitionType === 'SMART_ANIMATE') {
+      var source = el.closest('.proto-frame');
+      var triggerClass = 'smart-to-' + targetId.replace('frame-', '');
+      if (source) {
+        source.classList.add(triggerClass);
+        setTimeout(function () {
+          source.classList.remove(triggerClass);
+          cutOver();
+        }, duration || 300);
+        return;
+      }
+    }
+    applyTransition(target, transitionType, duration);
+    cutOver();
+  }
+  root.querySelectorAll('[data-reaction-trigger="ON_CLICK"]').forEach(function (el) {
+    el.style.cursor = 'pointer';
+    el.addEventListener('click', function () { handleReaction(el); });
+  });
+  root.querySelectorAll('[data-reaction-trigger="ON_HOVER"]').forEach(function (el) {
+    el.addEventListener('mouseenter', function () { handleReaction(el); });
+  });
+})();`;
+
+// ---------- Prototype export: Smart Animate diffing ----------
+// Figma's own Smart Animate matches layers between two frames by name (falling
+// back to cross-dissolve for anything unmatched) and tweens each matched
+// layer's own position/size/opacity/rotation/fill. This mirrors that: reuse
+// the *rendered* geometry (absoluteBoundingBox via childOffsetWithin/
+// renderedSize) the fixed-pixel converter already computes, rather than
+// re-deriving layout.
+
+// Preorder walk so occurrence order lines up exactly with buildSmartKeyMap's
+// `${name}#${index}` keys below — that's what lets a duplicate layer name
+// resolve to the right specific node instead of "some node with this name".
+function flattenTreeByName(root, map) {
+  const result = map || new Map();
+  const list = result.get(root.name) || [];
+  list.push(root);
+  result.set(root.name, list);
+  if (root.children) root.children.forEach((child) => flattenTreeByName(child, result));
+  return result;
+}
+
+function buildSmartKeyMap(root, counts, map) {
+  const countMap = counts || new Map();
+  const result = map || new Map();
+  const occurrence = countMap.get(root.name) || 0;
+  countMap.set(root.name, occurrence + 1);
+  result.set(root.id, `${root.name}#${occurrence}`);
+  if (root.children) root.children.forEach((child) => buildSmartKeyMap(child, countMap, result));
+  return result;
+}
+
+function solidFillHex(node) {
+  const fill = getSolidFill(node);
+  return fill && fill.color ? rgbToHex(fill.color, fill.opacity) : null;
+}
+
+// Figma's easing curve names, approximated with the nearest CSS keyword —
+// exact bezier control points aren't exposed on every easing type.
+const SMART_ANIMATE_EASING_CSS = {
+  EASE_IN: 'ease-in',
+  EASE_OUT: 'ease-out',
+  EASE_IN_AND_OUT: 'ease-in-out',
+  LINEAR: 'linear',
+  GENTLE: 'ease-in-out',
+  QUICK: 'ease-out',
+  BOUNCY: 'ease-out',
+  SLOW: 'ease-in-out',
+};
+
+// Diffs two *different* frames' subtrees (not two variants of the same node),
+// matched by layer name + occurrence order. Returns CSS that, scoped to
+// `source`'s section gaining a `smart-to-<dest.id>` class, tweens every
+// matched-and-changed layer toward `dest`'s values; unmatched layers are left
+// alone (they just cut over with the section swap — a cross-dissolve
+// approximation, not a real match).
+function diffFramesForSmartAnimate(source, dest, durationMs, easingType) {
+  const namesA = flattenTreeByName(source);
+  const namesB = flattenTreeByName(dest);
+  const duration = typeof durationMs === 'number' && durationMs > 0 ? durationMs : 300;
+  const easing = SMART_ANIMATE_EASING_CSS[easingType] || 'ease-in-out';
+  const rules = [];
+  let unmatchedCount = 0;
+
+  namesA.forEach((listA, name) => {
+    const listB = namesB.get(name);
+    if (!listB) {
+      unmatchedCount += listA.length;
+      return;
+    }
+    const count = Math.min(listA.length, listB.length);
+    unmatchedCount += listA.length - count;
+    for (let i = 0; i < count; i++) {
+      const nodeA = listA[i];
+      const nodeB = listB[i];
+      const posA = childOffsetWithin(source, nodeA);
+      const posB = childOffsetWithin(dest, nodeB);
+      const sizeA = renderedSize(nodeA);
+      const sizeB = renderedSize(nodeB);
+      const opacityA = typeof nodeA.opacity === 'number' ? nodeA.opacity : 1;
+      const opacityB = typeof nodeB.opacity === 'number' ? nodeB.opacity : 1;
+      const rotationA = nodeA.rotation || 0;
+      const rotationB = nodeB.rotation || 0;
+      const fillB = solidFillHex(nodeB);
+
+      const changed =
+        round(posA.left) !== round(posB.left) ||
+        round(posA.top) !== round(posB.top) ||
+        round(sizeA.width) !== round(sizeB.width) ||
+        round(sizeA.height) !== round(sizeB.height) ||
+        opacityA !== opacityB ||
+        rotationA !== rotationB ||
+        fillB !== solidFillHex(nodeA);
+      if (!changed) continue;
+
+      const declarations = [
+        `left: ${round(posB.left)}px`,
+        `top: ${round(posB.top)}px`,
+        `width: ${round(sizeB.width)}px`,
+        `height: ${round(sizeB.height)}px`,
+        `opacity: ${opacityB}`,
+      ];
+      if (rotationA !== rotationB) declarations.push(`transform: rotate(${round(-rotationB)}deg)`);
+      if (fillB) declarations.push(`background-color: ${fillB}`);
+
+      rules.push(
+        `#${frameSectionId(source)}.smart-to-${dest.id} [data-smart-key="${escapeAttr(`${name}#${i}`)}"] {\n  ${declarations.join(';\n  ')};\n}`
+      );
+    }
+  });
+
+  const transitionRule =
+    `#${frameSectionId(source)} [data-smart-key] {\n` +
+    `  transition: left ${duration}ms ${easing}, top ${duration}ms ${easing}, width ${duration}ms ${easing},\n` +
+    `    height ${duration}ms ${easing}, opacity ${duration}ms ${easing}, transform ${duration}ms ${easing},\n` +
+    `    background-color ${duration}ms ${easing};\n` +
+    `}`;
+
+  return {
+    css: [transitionRule].concat(rules).join('\n\n'),
+    warnings:
+      unmatchedCount > 0
+        ? [
+            `Smart Animate from "${source.name}" to "${dest.name}": ${unmatchedCount} layer(s) have no name match in the destination frame and will cut over instead of tween (approximation of Figma's own name-matching).`,
+          ]
+        : [],
+  };
+}
+
+// Only called when the user's selection is multiple top-level frames — see
+// buildSelectionPayload. Reuses the exact same per-frame generateHtml path
+// as the single-node HTML tab, just wrapped so reactions can jump between
+// the resulting sections.
+async function generatePrototypeBundle(frames) {
+  const eligible = (frames || []).filter((node) => node && typeof node.id === 'string');
+  const included = eligible.slice(0, MAX_PROTOTYPE_FRAMES);
+  const warnings = [];
+  if (eligible.length > included.length) {
+    warnings.push(
+      `Prototype export includes only the first ${MAX_PROTOTYPE_FRAMES} selected frames; ${
+        eligible.length - included.length
+      } more were skipped.`
+    );
+  }
+
+  const byId = new Map(included.map((frame) => [frame.id, frame]));
+  const frameReactionMaps = new Map(included.map((frame) => [frame.id, collectReactionsForTree(frame)]));
+
+  // Every (source frame -> destination frame) pair that has at least one
+  // SMART_ANIMATE reaction between two frames both present in this bundle.
+  const smartPairs = [];
+  const seenPairKeys = new Set();
+  frameReactionMaps.forEach((reactionMap, sourceId) => {
+    reactionMap.forEach((reactions) => {
+      reactions.forEach((reaction) => {
+        if (reaction.transitionType !== 'SMART_ANIMATE' || !byId.has(reaction.destinationId)) return;
+        const key = `${sourceId}->${reaction.destinationId}`;
+        if (seenPairKeys.has(key)) return;
+        seenPairKeys.add(key);
+        smartPairs.push({
+          source: byId.get(sourceId),
+          dest: byId.get(reaction.destinationId),
+          duration: reaction.transitionDuration,
+          easing: reaction.transitionEasing,
+        });
+      });
+    });
+  });
+
+  const smartKeyFrameIds = new Set();
+  smartPairs.forEach((pair) => {
+    smartKeyFrameIds.add(pair.source.id);
+    smartKeyFrameIds.add(pair.dest.id);
+  });
+
+  const sections = [];
+  for (let i = 0; i < included.length; i++) {
+    const frame = included[i];
+    const reactionMap = frameReactionMaps.get(frame.id);
+    const smartKeyMap = smartKeyFrameIds.has(frame.id) ? buildSmartKeyMap(frame) : null;
+    const result = await generateHtml(frame, reactionMap, smartKeyMap);
+    result.warnings.forEach((w) => warnings.push(w));
+    sections.push(
+      `<section id="${frameSectionId(frame)}" class="proto-frame"${i === 0 ? '' : ' hidden'}>\n${result.html}\n</section>`
+    );
+  }
+
+  const smartCss = smartPairs.map((pair) => {
+    const diff = diffFramesForSmartAnimate(pair.source, pair.dest, pair.duration, pair.easing);
+    diff.warnings.forEach((w) => warnings.push(w));
+    return diff.css;
+  });
+
+  const html =
+    `<div class="proto-root">\n${sections.join('\n')}\n</div>\n\n` +
+    `<style>\n.proto-root { position: relative; }\n.proto-frame[hidden] { display: none; }\n` +
+    `.proto-overlay { position: absolute; inset: 0; }\n\n${smartCss.join('\n\n')}\n</style>\n\n` +
+    `<script>\n${PROTOTYPE_BUNDLE_SCRIPT}\n</script>`;
+
+  return {
+    html,
+    warnings: warnings.filter((w, i, a) => a.indexOf(w) === i),
   };
 }
 
@@ -3352,6 +3824,10 @@ async function buildNodePayload(node, bindings, extraWarnings) {
       dart: dartResult.responsiveDart,
       html: htmlResult.responsiveHtml,
     },
+    // Opt-in: same fixed-pixel geometry as `html` above, but flattened vector
+    // icons stay real inline <svg> markup instead of a background-image data
+    // URI — never used unless ui.html's "Inline SVG icons" toggle is on.
+    inlineSvgHtml: htmlResult.inlineSvgHtml,
     // Real, named, downloadable files for whatever collectAssets/
     // collectFlutterAssets embedded as base64 above — the ui.html "Download
     // images" action decodes these and rewrites the copied code to reference
@@ -3389,6 +3865,23 @@ async function buildSelectionPayload(nodes) {
     payloads.push(await buildNodePayload(node, bindings, fontWarnings));
   }
 
+  // Opt-in only: a single-node selection (today's only supported case in the
+  // existing tabs) never gets this key, so `nodes`/everything else above is
+  // unchanged. Only a multi-frame selection is eligible for the bundled,
+  // clickable "Prototype" export — see generatePrototypeBundle.
+  // A bug in this newer, less-battle-tested path must never take the rest of
+  // the payload down with it — sendSelection's caller only has one try/catch
+  // for the *whole* payload, and a rejection there blanks every tab (ui.html
+  // treats any {type:'error'} the same as no selection), not just this one.
+  let prototype = null;
+  if (nodes.length > 1) {
+    try {
+      prototype = await generatePrototypeBundle(nodes);
+    } catch (e) {
+      prototype = { html: '', warnings: [`Prototype export failed: ${String(e && e.message ? e.message : e)}`] };
+    }
+  }
+
   return {
     type: 'selection',
     nodeName: payloads.length > 0 ? payloads[0].nodeName : '',
@@ -3397,6 +3890,7 @@ async function buildSelectionPayload(nodes) {
     skippedNames: nodes.slice(coded.length).map((node) => node.name),
     nodes: payloads,
     designSystem,
+    prototype,
   };
 }
 
@@ -3407,18 +3901,26 @@ let selectionGeneration = 0;
 
 async function sendSelection() {
   const generation = ++selectionGeneration;
-  // Variables and styles are editable while the plugin is open, so resolve them
-  // fresh per selection rather than serving a rename from cache. The cache still
-  // does its job *within* one selection, where the same token is hit repeatedly.
-  variableCache.clear();
-  variableCollectionCache.clear();
-  figmaStyleCache.clear();
-  const selection = figma.currentPage.selection;
-  if (selection.length === 0) {
-    figma.ui.postMessage({ type: 'empty' });
-    return;
-  }
+  // Everything below used to start outside this try (only the
+  // buildSelectionPayload call itself was guarded) — any failure reading the
+  // selection or clearing the caches was an *unhandled* promise rejection:
+  // no 'error' message, no 'empty' message, nothing. ui.html would just sit
+  // on whatever it last rendered (or its static "Select an element..."
+  // placeholder if this was the first selection since the panel opened),
+  // giving no indication anything had gone wrong.
   try {
+    // Variables and styles are editable while the plugin is open, so resolve
+    // them fresh per selection rather than serving a rename from cache. The
+    // cache still does its job *within* one selection, where the same token
+    // is hit repeatedly.
+    variableCache.clear();
+    variableCollectionCache.clear();
+    figmaStyleCache.clear();
+    const selection = figma.currentPage.selection;
+    if (selection.length === 0) {
+      if (generation === selectionGeneration) figma.ui.postMessage({ type: 'empty' });
+      return;
+    }
     const payload = await buildSelectionPayload(selection.slice());
     if (generation === selectionGeneration) {
       figma.ui.postMessage(payload);
@@ -3432,3 +3934,56 @@ async function sendSelection() {
 
 figma.on('selectionchange', sendSelection);
 sendSelection();
+
+// Independent of the selection-driven push above: a lightweight map of every
+// top-level frame on the page (grouped by Figma Section, where the designer
+// used one), for planning across a whole app instead of one selection at a
+// time. Only ever sent when the UI explicitly asks for it ('scan-page'),
+// never automatically — unlike the selection push, this exposes the file's
+// whole structure rather than just what the user selected, so it needs an
+// explicit opt-in click (Settings > MCP Connect > Scan page).
+function describePageChild(node) {
+  return {
+    name: node.name,
+    nodeType: node.type,
+    x: node.x,
+    y: node.y,
+    width: node.width,
+    height: node.height,
+    visible: node.visible,
+  };
+}
+
+function buildPageOverview() {
+  const sections = [];
+  const ungroupedScreens = [];
+  for (const child of figma.currentPage.children) {
+    if (child.type === 'SECTION') {
+      sections.push({
+        name: child.name,
+        x: child.x,
+        y: child.y,
+        width: child.width,
+        height: child.height,
+        screens: child.children.map(describePageChild),
+      });
+    } else {
+      ungroupedScreens.push(describePageChild(child));
+    }
+  }
+  return {
+    type: 'pageOverview',
+    pageName: figma.currentPage.name,
+    sections,
+    ungroupedScreens,
+  };
+}
+
+figma.ui.onmessage = (msg) => {
+  if (!msg || msg.type !== 'scan-page') return;
+  try {
+    figma.ui.postMessage(buildPageOverview());
+  } catch (e) {
+    figma.ui.postMessage({ type: 'pageOverviewError', message: String(e && e.message ? e.message : e) });
+  }
+};

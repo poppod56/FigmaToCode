@@ -89,6 +89,13 @@ globalThis.__testApi = {
   generateDartForNode,
   generateDart,
   buildDesignSystem,
+  extractReactions,
+  collectReactionsForTree,
+  generatePrototypeBundle,
+  diffFramesForSmartAnimate,
+  buildSmartKeyMap,
+  utf8BytesToString,
+  sizeInlineSvg,
 };`,
   context,
   { filename: 'code.js' }
@@ -117,6 +124,20 @@ async function run() {
     /cssFromGeneratedHtml\(htmlCode\) \|\|[\s\S]*?formatCss\(source\.css\)/
   );
   assert.match(uiSource, /id="exclude-base64-toggle"/);
+  assert.match(uiSource, /data-tab="prototype"/);
+  assert.match(uiSource, /id="panel-prototype"/);
+  assert.match(uiSource, /renderPrototype\(message\)/);
+  assert.match(
+    uiSource,
+    /oldScript\.replaceWith\(newScript\)/
+  );
+  assert.match(uiSource, /window\.__figmaPrototypeRoot = host\.shadowRoot;/);
+  assert.match(source, /var root = window\.__figmaPrototypeRoot \|\| document;/);
+  assert.match(uiSource, /id="inline-svg-toggle"/);
+  assert.match(
+    uiSource,
+    /if \(inlineSvgMode && !responsiveMode && payload\.inlineSvgHtml\) source\.html = payload\.inlineSvgHtml;/
+  );
   assert.match(
     uiSource,
     /excludeBase64[\s\S]*?rewriteHtmlWithAssetPaths\(source\.html, payload\.htmlAssets \|\| \[\]\)[\s\S]*?rewriteDartWithAssetPaths\(source\.dart, payload\.dartAssets \|\| \[\]\)/
@@ -937,6 +958,254 @@ async function run() {
   assert.match(anchorDart.responsiveDart, /left: 10,\n\s*right: 10,/); // STRETCH
   assert.match(anchorDart.responsiveDart, /FractionallySizedBox\(/); // SCALE
   assert.match(anchorDart.responsiveDart, /widthFactor: 0\.25,/);
+
+  // ---------- Prototype export: reactions ----------
+  const dissolveReaction = {
+    trigger: { type: 'ON_CLICK' },
+    action: {
+      type: 'NODE',
+      navigation: 'NAVIGATE',
+      destinationId: 'frame-b',
+      transition: { type: 'DISSOLVE', duration: 0.3, easing: { type: 'EASE_OUT' } },
+    },
+  };
+  const buttonNode = {
+    id: 'button-a',
+    type: 'FRAME',
+    name: 'Button',
+    width: 100,
+    height: 40,
+    x: 10,
+    y: 10,
+    opacity: 1,
+    visible: true,
+    fills: [],
+    strokes: [],
+    effects: [],
+    absoluteBoundingBox: { x: 10, y: 10, width: 100, height: 40 },
+    reactions: [dissolveReaction],
+    children: [],
+  };
+  const frameANode = {
+    id: 'frame-a',
+    type: 'FRAME',
+    name: 'Frame A',
+    width: 400,
+    height: 300,
+    x: 0,
+    y: 0,
+    opacity: 1,
+    visible: true,
+    fills: [],
+    strokes: [],
+    effects: [],
+    absoluteBoundingBox: { x: 0, y: 0, width: 400, height: 300 },
+    children: [buttonNode],
+  };
+
+  const buttonReactions = api.extractReactions(buttonNode);
+  assert.equal(buttonReactions.length, 1);
+  assert.equal(buttonReactions[0].trigger, 'ON_CLICK');
+  assert.equal(buttonReactions[0].navigation, 'NAVIGATE');
+  assert.equal(buttonReactions[0].destinationId, 'frame-b');
+  assert.equal(buttonReactions[0].transitionType, 'DISSOLVE');
+  assert.equal(buttonReactions[0].transitionDuration, 300);
+  assert.equal(buttonReactions[0].transitionEasing, 'EASE_OUT');
+  assert.equal(api.extractReactions(frameANode).length, 0); // no reactions of its own — untouched by default
+
+  const reactionMap = api.collectReactionsForTree(frameANode);
+  assert.equal(reactionMap.size, 1);
+  assert.equal(reactionMap.get('button-a')[0].destinationId, 'frame-b');
+
+  const singleFrameBundle = await api.generatePrototypeBundle([frameANode]);
+  assert.match(singleFrameBundle.html, /<section id="frame-frame-a" class="proto-frame">/);
+  assert.match(singleFrameBundle.html, /data-reaction-trigger="ON_CLICK"/);
+  assert.match(singleFrameBundle.html, /data-reaction-target="frame-frame-b"/);
+  assert.match(singleFrameBundle.html, /data-reaction-transition="DISSOLVE"/);
+  assert.match(singleFrameBundle.html, /data-reaction-duration="300"/);
+
+  // ---------- Prototype export: Smart Animate diffing ----------
+  const boxInC = {
+    id: 'box-c',
+    type: 'RECTANGLE',
+    name: 'Box',
+    width: 50,
+    height: 50,
+    x: 0,
+    y: 0,
+    opacity: 1,
+    visible: true,
+    fills: [solid(1, 0, 0)],
+    strokes: [],
+    effects: [],
+    absoluteBoundingBox: { x: 0, y: 0, width: 50, height: 50 },
+    children: [],
+  };
+  const boxInD = {
+    ...boxInC,
+    id: 'box-d',
+    absoluteBoundingBox: { x: 200, y: 100, width: 50, height: 50 },
+  };
+  const triggerInC = {
+    id: 'trigger-c',
+    type: 'FRAME',
+    name: 'Trigger',
+    width: 20,
+    height: 20,
+    x: 0,
+    y: 0,
+    opacity: 1,
+    visible: true,
+    fills: [],
+    strokes: [],
+    effects: [],
+    absoluteBoundingBox: { x: 0, y: 0, width: 20, height: 20 },
+    reactions: [
+      {
+        trigger: { type: 'ON_CLICK' },
+        action: {
+          type: 'NODE',
+          navigation: 'CHANGE_TO',
+          destinationId: 'frame-d',
+          transition: { type: 'SMART_ANIMATE', duration: 0.4, easing: { type: 'EASE_IN_AND_OUT' } },
+        },
+      },
+    ],
+    children: [],
+  };
+  const frameCNode = {
+    id: 'frame-c',
+    type: 'FRAME',
+    name: 'Frame C',
+    width: 400,
+    height: 300,
+    x: 0,
+    y: 0,
+    opacity: 1,
+    visible: true,
+    fills: [],
+    strokes: [],
+    effects: [],
+    absoluteBoundingBox: { x: 0, y: 0, width: 400, height: 300 },
+    children: [triggerInC, boxInC],
+  };
+  const frameDNode = {
+    id: 'frame-d',
+    type: 'FRAME',
+    name: 'Frame D',
+    width: 400,
+    height: 300,
+    x: 0,
+    y: 0,
+    opacity: 1,
+    visible: true,
+    fills: [],
+    strokes: [],
+    effects: [],
+    absoluteBoundingBox: { x: 0, y: 0, width: 400, height: 300 },
+    children: [boxInD],
+  };
+
+  assert.equal(api.buildSmartKeyMap(frameCNode).get('box-c'), 'Box#0');
+
+  const diff = api.diffFramesForSmartAnimate(frameCNode, frameDNode, 400, 'EASE_IN_AND_OUT');
+  assert.match(
+    diff.css,
+    /#frame-frame-c\.smart-to-frame-d \[data-smart-key="Box#0"\] \{\n\s*left: 200px;\n\s*top: 100px;/
+  );
+  assert.match(diff.css, /transition: left 400ms ease-in-out/);
+  // "Frame C"/"Frame D" (differently-named roots) and "Trigger" (only in C)
+  // have no counterpart — cross-dissolve fallback, not a tween.
+  assert.equal(diff.warnings.length, 1);
+  assert.match(diff.warnings[0], /2 layer\(s\) have no name match/);
+
+  const smartBundle = await api.generatePrototypeBundle([frameCNode, frameDNode]);
+  assert.match(smartBundle.html, /<section id="frame-frame-c" class="proto-frame">/);
+  assert.match(smartBundle.html, /<section id="frame-frame-d" class="proto-frame" hidden>/);
+  assert.match(smartBundle.html, /data-smart-key="Box#0"/);
+  assert.match(smartBundle.html, /smart-to-frame-d \[data-smart-key="Box#0"\]/);
+  assert.match(smartBundle.html, /data-reaction-transition="SMART_ANIMATE"/);
+
+  // ---------- Inline SVG opt-in mode ----------
+  function stringToBytes(str) {
+    const bytes = new Uint8Array(str.length);
+    for (let i = 0; i < str.length; i++) bytes[i] = str.charCodeAt(i);
+    return bytes;
+  }
+
+  assert.equal(api.utf8BytesToString(stringToBytes('<svg></svg>')), '<svg></svg>');
+  assert.equal(
+    api.sizeInlineSvg('<svg width="24" height="24">'),
+    '<svg style="width:100%;height:100%;display:block" width="24" height="24">'
+  );
+
+  const plainIconSvg = '<svg width="16" height="16" viewBox="0 0 16 16"><path d="M0 0h16v16H0z"/></svg>';
+  const plainIconNode = {
+    id: 'vector-plain',
+    type: 'VECTOR',
+    name: 'icon',
+    width: 16,
+    height: 16,
+    x: 0,
+    y: 0,
+    opacity: 1,
+    visible: true,
+    fills: [solid(0, 0, 0)],
+    strokes: [],
+    effects: [],
+    absoluteBoundingBox: { x: 0, y: 0, width: 16, height: 16 },
+    absoluteRenderBounds: { x: 0, y: 0, width: 16, height: 16 },
+    children: [],
+    async exportAsync(opts) {
+      assert.equal(opts.format, 'SVG');
+      return stringToBytes(plainIconSvg);
+    },
+  };
+
+  const plainIconResult = await api.generateHtml(plainIconNode);
+  // Default output is byte-for-byte the same background-image behavior as before.
+  assert.match(plainIconResult.html, /background-image: url\("data:image\/svg\+xml;base64,/);
+  assert.doesNotMatch(plainIconResult.html, /<svg/);
+  // Opt-in variant: real, sized inline <svg> markup instead.
+  assert.match(
+    plainIconResult.inlineSvgHtml,
+    /<div class="icon">.*<svg style="width:100%;height:100%;display:block"[\s\S]*<\/svg><\/div>/
+  );
+  assert.doesNotMatch(plainIconResult.inlineSvgHtml, /background-image/);
+
+  // A shadow/stroke can make the exported render bigger than the node's own
+  // layout box — the default falls back to a ::before background trick; the
+  // inline-SVG variant needs its own absolutely-positioned wrapper instead
+  // (a pseudo-element can't hold real child markup).
+  const boundsIconSvg = '<svg width="24" height="24" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg>';
+  const boundsIconNode = {
+    id: 'vector-bounds',
+    type: 'VECTOR',
+    name: 'badge_icon',
+    width: 16,
+    height: 16,
+    x: 0,
+    y: 0,
+    opacity: 1,
+    visible: true,
+    fills: [solid(0, 0, 0)],
+    strokes: [],
+    effects: [],
+    absoluteBoundingBox: { x: 0, y: 0, width: 16, height: 16 },
+    absoluteRenderBounds: { x: -4, y: -4, width: 24, height: 24 },
+    children: [],
+    async exportAsync() {
+      return stringToBytes(boundsIconSvg);
+    },
+  };
+
+  const boundsIconResult = await api.generateHtml(boundsIconNode);
+  assert.match(boundsIconResult.html, /::before/); // default still uses the pseudo-element background trick
+  assert.match(boundsIconResult.inlineSvgHtml, /<div class="badge-icon-svg">/);
+  assert.match(
+    boundsIconResult.inlineSvgHtml,
+    /\.badge-icon-svg \{\n\s*position: absolute;\n\s*left: -4px;/
+  );
 
   console.log('code regression tests passed');
 }
