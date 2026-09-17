@@ -3934,3 +3934,56 @@ async function sendSelection() {
 
 figma.on('selectionchange', sendSelection);
 sendSelection();
+
+// Independent of the selection-driven push above: a lightweight map of every
+// top-level frame on the page (grouped by Figma Section, where the designer
+// used one), for planning across a whole app instead of one selection at a
+// time. Only ever sent when the UI explicitly asks for it ('scan-page'),
+// never automatically — unlike the selection push, this exposes the file's
+// whole structure rather than just what the user selected, so it needs an
+// explicit opt-in click (Settings > MCP Connect > Scan page).
+function describePageChild(node) {
+  return {
+    name: node.name,
+    nodeType: node.type,
+    x: node.x,
+    y: node.y,
+    width: node.width,
+    height: node.height,
+    visible: node.visible,
+  };
+}
+
+function buildPageOverview() {
+  const sections = [];
+  const ungroupedScreens = [];
+  for (const child of figma.currentPage.children) {
+    if (child.type === 'SECTION') {
+      sections.push({
+        name: child.name,
+        x: child.x,
+        y: child.y,
+        width: child.width,
+        height: child.height,
+        screens: child.children.map(describePageChild),
+      });
+    } else {
+      ungroupedScreens.push(describePageChild(child));
+    }
+  }
+  return {
+    type: 'pageOverview',
+    pageName: figma.currentPage.name,
+    sections,
+    ungroupedScreens,
+  };
+}
+
+figma.ui.onmessage = (msg) => {
+  if (!msg || msg.type !== 'scan-page') return;
+  try {
+    figma.ui.postMessage(buildPageOverview());
+  } catch (e) {
+    figma.ui.postMessage({ type: 'pageOverviewError', message: String(e && e.message ? e.message : e) });
+  }
+};

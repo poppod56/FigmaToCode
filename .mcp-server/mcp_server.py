@@ -43,19 +43,25 @@ except ImportError:
 
 WS_PORT = 8788
 
-# The most recent selection payload pushed by the plugin's ui.html over the
-# WebSocket below. Only one Figma tab is ever expected to connect at a time,
-# so a single shared value (not a per-connection cache) is enough.
+# The most recent selection and whole-page-scan payloads pushed by the
+# plugin's ui.html over the WebSocket below. Only one Figma tab is ever
+# expected to connect at a time, so a single shared value per kind (not a
+# per-connection cache) is enough.
 _latest_selection = None
+_latest_page_overview = None
 
 
 async def _handle_plugin_connection(websocket):
-    global _latest_selection
+    global _latest_selection, _latest_page_overview
     async for message in websocket:
         try:
-            _latest_selection = json.loads(message)
+            payload = json.loads(message)
         except ValueError:
             continue
+        if payload.get("type") == "pageOverview":
+            _latest_page_overview = payload
+        else:
+            _latest_selection = payload
 
 
 def _run_websocket_bridge():
@@ -87,6 +93,18 @@ description, or "what should this look like" — stop and call \
 list_selected_nodes() first. If it returns nodes, use this server instead of \
 guessing.
 
+Planning across a whole app (multiple screens), not just one selection: \
+call list_page_screens() first. It's the closest thing to a screenshot of \
+the whole file without pulling one — every top-level frame's name, position \
+and size, grouped by Figma Section where the designer used one (a \
+Section's name is usually the flow/feature it groups, e.g. "Onboarding" or \
+"Checkout"). Use it to decide what exists, how screens relate spatially, \
+and what order to tackle them in, before following the per-selection \
+workflow below for whichever one you pick. Unlike the selection tools, this \
+requires the user to have clicked Settings > MCP Connect > Scan page at \
+least once — it isn't sent automatically, since it exposes the file's whole \
+structure rather than just what's selected.
+
 Standard workflow:
 1. list_selected_nodes() — see what's selected, by index.
 2. get_node_metadata(index) — width/height/warnings. Compare width/height \
@@ -100,7 +118,10 @@ type scale, and spacing before inventing any values of your own.
 output) — write ready-to-use code plus a real assets/ folder (images \
 already rewritten to real file paths, never left as inline base64) and a \
 preview.png. Prefer this over get_node_code when you're actually building \
-something, not just inspecting.
+something, not just inspecting. get_selection_code(indices, output) is the \
+lighter-weight option for inspecting several layers at once without writing \
+files — it still strips inline base64 to an assets/ placeholder path, so it \
+stays safe to use even with a small context window.
 5. get_prototype_html() — when 2+ frames were selected together, this is \
 the ground truth for navigation between screens (which reactions/links go \
 where) — use it instead of guessing screen flow, and to see which layers \
@@ -294,6 +315,30 @@ def _rewrite_code_with_asset_paths(code: str, output: str, assets: list) -> str:
 
 
 @mcp.tool()
+def list_page_screens() -> dict:
+    """Return a lightweight map of every top-level frame on the current
+    Figma page, grouped by Figma Section where the designer used one — name,
+    position (x/y), size (width/height), and visibility only, no generated
+    code. Use this before diving into any one screen, to see how many
+    screens the whole app has, which ones are grouped together (a Section's
+    name is usually the flow/feature it groups), and how they're laid out on
+    the canvas. Requires the user to have clicked Settings > MCP Connect >
+    Scan page at least once — it isn't pushed automatically like the
+    selection is, since it exposes the file's whole structure rather than
+    just what's selected."""
+    if not _latest_page_overview:
+        raise ValueError(
+            "No page overview yet. In Figma, open the FigmaToCode plugin and "
+            "click Settings > MCP Connect > Scan page."
+        )
+    return {
+        "pageName": _latest_page_overview["pageName"],
+        "sections": _latest_page_overview["sections"],
+        "ungroupedScreens": _latest_page_overview["ungroupedScreens"],
+    }
+
+
+@mcp.tool()
 def list_selected_nodes() -> list:
     """List every currently-selected layer's index, name, and type. Call this
     first to see what's selected before calling other tools by index."""
@@ -332,6 +377,44 @@ def get_node_code(index: int = 0, output: str = "css") -> str:
     if getter is None:
         raise ValueError(f"output must be one of: {', '.join(_CODE_FIELDS)}")
     return getter(node)
+
+
+@mcp.tool()
+def get_selection_code(indices: list = None, output: str = "html") -> list:
+    """Return generated code for several (or, by default, all) selected
+    layers in one call, with any image assets replaced by an
+    `assets/<filename>` placeholder path instead of inline base64 — safe to
+    use with a low-context client, unlike raw get_node_code on an
+    image-heavy selection. Each result also lists the assets that code
+    references (filename + mimeType, no bytes); fetch the real files
+    afterward with export_node_assets or export_node if you need them.
+    `output` accepts the same values as get_node_code. `indices` (default:
+    every selected node) picks which layers to include — see
+    list_selected_nodes."""
+    nodes = _selection_or_raise()["nodes"]
+    if indices is None:
+        indices = list(range(len(nodes)))
+    if output not in _CODE_FIELDS:
+        raise ValueError(f"output must be one of: {', '.join(_CODE_FIELDS)}")
+    getter = _CODE_FIELDS[output]
+    # Responsive variants reuse the same top-level asset lists as their
+    # fixed-pixel counterpart — ui.html's own copy/download buttons do the
+    # same lookup (see rewriteHtmlWithAssetPaths call sites).
+    asset_key = _ASSET_FIELDS.get(output.replace("responsive_", "", 1))
+    results = []
+    for i in indices:
+        node = _node_or_raise(i)
+        code = getter(node)
+        assets = node.get(asset_key, []) if asset_key else []
+        if assets:
+            code = _rewrite_code_with_asset_paths(code, "dart" if "dart" in output else "html", assets)
+        results.append({
+            "index": i,
+            "name": node["nodeName"],
+            "code": code,
+            "assets": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in assets],
+        })
+    return results
 
 
 @mcp.tool()
