@@ -485,6 +485,7 @@ import asyncio
 import base64
 import json
 import os
+import tempfile
 import threading
 
 import websockets
@@ -506,6 +507,18 @@ WS_PORT = 8788
 _latest_selection = None
 _latest_page_overview = None
 
+# Opening several editor windows on this project each spawns its own
+# mcp_server.py (one per MCP client instance), and every one of them tries
+# to bind WS_PORT for the Figma plugin to talk to — only the first can win
+# that race. Rather than have the rest crash on "address already in use",
+# whichever one is left holding the port writes every payload it receives
+# here; the others poll this file instead of running their own server, so
+# every window's MCP tools stay populated regardless of which process the
+# plugin actually connects to. Local temp dir only, single-user trust model
+# — same as the "only ever accepts connections from localhost" bridge below.
+_SHARED_STATE_PATH = os.path.join(tempfile.gettempdir(), "figma-to-code-mcp-bridge-state.json")
+_LEADER_RETRY_SECONDS = 5
+
 
 async def _handle_plugin_connection(websocket):
     global _latest_selection, _latest_page_overview
@@ -518,19 +531,56 @@ async def _handle_plugin_connection(websocket):
             _latest_page_overview = payload
         else:
             _latest_selection = payload
+        _write_shared_state()
+
+
+def _write_shared_state():
+    # Only ever called from the single process that currently holds
+    # WS_PORT, so a plain write-then-replace (no locking) is enough; the
+    # temp suffix plus os.replace keeps a concurrent reader from ever
+    # seeing a half-written file.
+    tmp_path = f"{_SHARED_STATE_PATH}.tmp-{os.getpid()}"
+    with open(tmp_path, "w") as f:
+        json.dump({"selection": _latest_selection, "pageOverview": _latest_page_overview}, f)
+    os.replace(tmp_path, _SHARED_STATE_PATH)
+
+
+def _read_shared_state():
+    global _latest_selection, _latest_page_overview
+    try:
+        with open(_SHARED_STATE_PATH) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return
+    if state.get("selection") is not None:
+        _latest_selection = state["selection"]
+    if state.get("pageOverview") is not None:
+        _latest_page_overview = state["pageOverview"]
 
 
 def _run_websocket_bridge():
     # Own event loop in a background thread so it never blocks the MCP
     # server's stdio event loop started from __main__ below.
     async def main():
-        # websockets' 1 MiB default max_size drops any selection whose
-        # payload (preview PNG + per-node CSS/HTML/Dart + image assets, all
-        # base64) runs bigger than that — trivially easy with just a couple
-        # of image-heavy layers selected. Unbounded is fine here: this only
-        # ever accepts connections from localhost.
-        async with websockets.serve(_handle_plugin_connection, "localhost", WS_PORT, max_size=None):
-            await asyncio.Future()
+        while True:
+            try:
+                # websockets' 1 MiB default max_size drops any selection whose
+                # payload (preview PNG + per-node CSS/HTML/Dart + image assets,
+                # all base64) runs bigger than that — trivially easy with just
+                # a couple of image-heavy layers selected. Unbounded is fine
+                # here: this only ever accepts connections from localhost.
+                async with websockets.serve(_handle_plugin_connection, "localhost", WS_PORT, max_size=None):
+                    # Winning the bind makes this process the leader for as
+                    # long as it stays alive.
+                    await asyncio.Future()
+            except OSError:
+                # A sibling mcp_server.py (another open window) already owns
+                # WS_PORT. Don't crash — fall back to polling its shared
+                # state so this process's tools stay populated, and keep
+                # retrying the bind in case that sibling exits, so leadership
+                # (and direct plugin data) fails over automatically.
+                _read_shared_state()
+                await asyncio.sleep(_LEADER_RETRY_SECONDS)
 
     asyncio.run(main())
 
